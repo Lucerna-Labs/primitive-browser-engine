@@ -18,6 +18,9 @@
 use cap_geometry::{Bounds, Pixels};
 use cap_primitives::{Fill, Primitive, Rgba, Shape};
 
+mod paint;
+pub use paint::paint_with_layout;
+
 // ---------------------------------------------------------------------------
 // Display list — the deterministic, golden-testable artifact
 // ---------------------------------------------------------------------------

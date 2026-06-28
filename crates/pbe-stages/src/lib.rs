@@ -28,6 +28,40 @@ use pbe_protocol::{
     SOCK_FRAME_READY, SOCK_PAINT_READY, SOCK_RENDER_REQUEST, SOCK_STYLED_READY,
 };
 
+/// Minimal user-agent stylesheet. The kit's cascade uses the CSS *initial*
+/// value `display:inline` for any element with no matching rule (spec-correct),
+/// but real browsers ship a UA sheet that makes structural elements block-level
+/// and gives headings/margins their familiar look. Without this, every element
+/// lays out inline and a page collapses to one row. We supply it by composition
+/// (prepended to author CSS) rather than modifying the kit. Lowest precedence,
+/// so author CSS always wins.
+///
+/// NOTE: the kit's MVP selector parser does NOT support comma selector lists
+/// (it treats `,` as a descendant combinator), so every rule here uses a single
+/// type selector. One rule per element — verbose but correct against the kit.
+const USER_AGENT_CSS: &str = "\
+html { display: block; } body { display: block; margin: 8px; } \
+div { display: block; } p { display: block; margin: 16px 0; } \
+section { display: block; } article { display: block; } \
+header { display: block; } footer { display: block; } \
+main { display: block; } nav { display: block; } aside { display: block; } \
+figure { display: block; } figcaption { display: block; } \
+blockquote { display: block; margin: 16px 40px; } \
+ul { display: block; margin: 16px 0; padding: 0 0 0 40px; } \
+ol { display: block; margin: 16px 0; padding: 0 0 0 40px; } \
+li { display: block; } dl { display: block; } dt { display: block; } \
+dd { display: block; } table { display: block; } form { display: block; } \
+fieldset { display: block; } pre { display: block; } \
+address { display: block; } hr { display: block; } \
+h1 { display: block; font-size: 32px; margin: 21px 0; } \
+h2 { display: block; font-size: 24px; margin: 20px 0; } \
+h3 { display: block; font-size: 19px; margin: 18px 0; } \
+h4 { display: block; font-size: 16px; margin: 21px 0; } \
+h5 { display: block; font-size: 13px; margin: 22px 0; } \
+h6 { display: block; font-size: 11px; margin: 24px 0; } \
+a { color: #0000ee; } strong { font-weight: 700; } b { font-weight: 700; } \
+";
+
 /// Default frame size for the render off-ramp (CSS px == device px for now).
 const FRAME_W: u32 = 800;
 const FRAME_H: u32 = 600;
@@ -122,13 +156,18 @@ impl Strand for BuildStyledStage {
             // CSS the caller supplied out-of-band. This is what lets fetched
             // pages style themselves, not just locally-supplied CSS.
             let embedded = extract_style_blocks(&req.html);
-            let combined_css = if embedded.is_empty() {
-                req.css.clone()
-            } else if req.css.trim().is_empty() {
-                embedded
-            } else {
-                format!("{embedded}\n{}", req.css)
-            };
+            // UA sheet first (lowest precedence), then embedded <style>, then
+            // any caller-supplied author CSS (highest). The cascade resolves
+            // precedence by source order within author origin.
+            let mut combined_css = String::from(USER_AGENT_CSS);
+            if !embedded.is_empty() {
+                combined_css.push('\n');
+                combined_css.push_str(&embedded);
+            }
+            if !req.css.trim().is_empty() {
+                combined_css.push('\n');
+                combined_css.push_str(&req.css);
+            }
 
             let sheet = cap_css_parse::Stylesheet::parse_author(&combined_css);
             let styled = cap_style_cascade::StyledDom::new(dom, &[sheet]);
@@ -173,10 +212,14 @@ impl Strand for PaintStage {
 
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         for ready in bus.recv::<StyledReady>(SOCK_STYLED_READY)? {
-            let primitives = cap_paint::paint(&ready.styled);
+            // Real layout (cap-layout/taffy) then layout-aware paint, instead of
+            // the kit's origin-anchored cap-paint. Boxes land at true positions.
+            let layout = pbe_layout::layout(&ready.styled, FRAME_W as f32, FRAME_H as f32);
+            let primitives = pbe_render::paint_with_layout(&ready.styled, &layout);
             bus.log(&format!(
-                "{}: painted {} primitive(s)",
+                "{}: laid out {} box(es), painted {} primitive(s)",
                 ready.label,
+                layout.len(),
                 primitives.len()
             ));
             bus.publish_static(

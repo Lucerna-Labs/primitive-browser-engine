@@ -9,3 +9,10 @@ description = "Render off-ramp — turns a paint primitive list into a determini
 [dependencies]
 cap-primitives = { workspace = true }
 cap-geometry = { workspace = true }
+cap-html-parse = { workspace = true }
+cap-style-cascade = { workspace = true }
+cap-color = { workspace = true }
+pbe-layout = { workspace = true }
+
+[dev-dependencies]
+cap-css-parse = { workspace = true }
