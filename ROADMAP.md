@@ -55,6 +55,21 @@ Long-term, this becomes the `aegis-render` in-process backend behind the
 `BrowserBackend` trait in `C:\Projects\aegis-browser` — replacing the Servo
 WebDriver backend with direct Rust calls. (See that project's DESIGN.md §2/§6.5.)
 
+## Build hygiene
+
+Zero-warning build, verified 2026-06-28:
+- `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
+- `cargo fmt --check` (pbe-* crates) → exit 0
+- `cargo test --workspace` → 4 passed
+- `cargo build --release` + `cargo run --release --bin pbe` → exit 0, no warnings
+
+The lone prior warnings were dead-code on the `HtmlTreeSink` placeholder in
+`cap-html-parse` (the F: kit). Fixed at the source with `#[allow(dead_code)]`
+(approved kit edit; additive, reversible) since that stub is intentionally
+unused until spec-compliant parsing is wired. NOTE: `F:\browser primitves` is
+not a git repo, so that fix lives only in the working tree there — re-apply if
+the kit is ever reset/re-cloned.
+
 ## Known seams / walls
 
 - **Two primitive vocabularies** (`cap-primitives` vs `ordo-ux-primitives`) —
