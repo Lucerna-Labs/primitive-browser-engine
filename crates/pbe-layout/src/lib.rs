@@ -53,6 +53,16 @@ impl LayoutResult {
 /// (pbe text stage) refines this; this keeps layout honest without a font here.
 const AVG_GLYPH_W_RATIO: f32 = 0.5;
 
+/// Elements whose subtree is metadata/script, not rendered page content. A real
+/// browser's UA sheet sets these to `display:none`; the kit ships no UA sheet,
+/// so we drop them here (also prevents `<style>`/`<script>` text from painting).
+fn is_non_rendered(tag: &str) -> bool {
+    matches!(
+        tag,
+        "head" | "style" | "script" | "title" | "meta" | "link" | "base" | "noscript" | "template"
+    )
+}
+
 /// Compute layout for a styled DOM at the given viewport size.
 ///
 /// Returns the absolute box of every element (and text node) reachable from the
@@ -117,6 +127,16 @@ fn build_node(
             id,
             children: Vec::new(),
         });
+    }
+
+    // Non-rendered elements: their contents never produce boxes or visible text
+    // (CSS gives them `display:none` in the UA sheet, but the kit ships none, so
+    // skip them structurally here). This also prevents <style>/<script> text
+    // from being laid out and painted as page content.
+    if let Some(tag) = node.tag() {
+        if is_non_rendered(tag) {
+            return None;
+        }
     }
 
     // Elements and the document: container nodes.

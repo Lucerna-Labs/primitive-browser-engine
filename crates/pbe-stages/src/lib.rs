@@ -213,20 +213,23 @@ impl Strand for PaintStage {
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         for ready in bus.recv::<StyledReady>(SOCK_STYLED_READY)? {
             // Real layout (cap-layout/taffy) then layout-aware paint, instead of
-            // the kit's origin-anchored cap-paint. Boxes land at true positions.
+            // the kit's origin-anchored cap-paint. Boxes land at true positions;
+            // text runs are emitted for the render stage to shape + rasterize.
             let layout = pbe_layout::layout(&ready.styled, FRAME_W as f32, FRAME_H as f32);
-            let primitives = pbe_render::paint_with_layout(&ready.styled, &layout);
+            let painted = pbe_render::paint_with_layout(&ready.styled, &layout);
             bus.log(&format!(
-                "{}: laid out {} box(es), painted {} primitive(s)",
+                "{}: laid out {} box(es), painted {} primitive(s), {} text run(s)",
                 ready.label,
                 layout.len(),
-                primitives.len()
+                painted.primitives.len(),
+                painted.texts.len()
             ));
             bus.publish_static(
                 SOCK_PAINT_READY,
                 PaintReady {
                     label: ready.label,
-                    primitives: Arc::new(primitives),
+                    primitives: Arc::new(painted.primitives),
+                    texts: Arc::new(painted.texts),
                 },
             )?;
         }
@@ -258,13 +261,21 @@ impl Strand for RenderStage {
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         for done in bus.recv::<PaintReady>(SOCK_PAINT_READY)? {
             let display_list = pbe_render::display_list(&done.primitives);
-            let raster = pbe_render::rasterize(&done.primitives, FRAME_W, FRAME_H, PAGE_BG);
+            // Full page: box layer + shaped/rasterized text on top.
+            let raster = pbe_render::rasterize_page(
+                &done.primitives,
+                &done.texts,
+                FRAME_W,
+                FRAME_H,
+                PAGE_BG,
+            );
             let ppm = raster.to_ppm();
             bus.log(&format!(
-                "{}: rendered {}x{} frame ({} bytes PPM)",
+                "{}: rendered {}x{} frame, {} text run(s) ({} bytes PPM)",
                 done.label,
                 FRAME_W,
                 FRAME_H,
+                done.texts.len(),
                 ppm.len()
             ));
             bus.publish_static(

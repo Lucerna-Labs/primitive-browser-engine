@@ -1,0 +1,2 @@
+display-list: 1 item(s)
+  [  0] rect          rect=(   8.0, 124.0  700.0x 120.0) fill=#1e2430ff

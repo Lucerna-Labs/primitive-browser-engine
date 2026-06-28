@@ -12,7 +12,13 @@ cap-geometry = { workspace = true }
 cap-html-parse = { workspace = true }
 cap-style-cascade = { workspace = true }
 cap-color = { workspace = true }
+cap-text-shape = { workspace = true }
 pbe-layout = { workspace = true }
+pbe-protocol = { workspace = true }
+# Sealed glyph-outline rasterizer (pure-Rust bezier coverage). We drive it from
+# outside to turn shaped glyphs into pixels; the engine links no font/TTF logic
+# of its own beyond this and cosmic-text's shaping.
+ab_glyph = "0.2"
 
 [dev-dependencies]
 cap-css-parse = { workspace = true }

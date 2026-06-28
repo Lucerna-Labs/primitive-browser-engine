@@ -19,7 +19,10 @@ use cap_geometry::{Bounds, Pixels};
 use cap_primitives::{Fill, Primitive, Rgba, Shape};
 
 mod paint;
-pub use paint::paint_with_layout;
+mod text;
+pub use paint::{paint_with_layout, Painted};
+use pbe_protocol::TextDraw;
+pub use text::TextRasterizer;
 
 // ---------------------------------------------------------------------------
 // Display list — the deterministic, golden-testable artifact
@@ -182,6 +185,25 @@ impl Raster {
         }
     }
 
+    /// Alpha-blend a single pixel with a coverage value in `0.0..=1.0` (used by
+    /// the glyph rasterizer). `color` is linear `[r,g,b,a]` in `0.0..=1.0`.
+    /// Out-of-bounds pixels are ignored.
+    pub fn blend_px(&mut self, x: i32, y: i32, color: [f32; 4], coverage: f32) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let a = (color[3] * coverage).clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return;
+        }
+        let i = ((y as u32 * self.width + x as u32) * 4) as usize;
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        self.pixels[i] = blend(self.pixels[i], to_u8(color[0]), a);
+        self.pixels[i + 1] = blend(self.pixels[i + 1], to_u8(color[1]), a);
+        self.pixels[i + 2] = blend(self.pixels[i + 2], to_u8(color[2]), a);
+        self.pixels[i + 3] = 255;
+    }
+
     /// Serialize as a binary PPM (P6) image — readable by most image viewers.
     pub fn to_ppm(&self) -> Vec<u8> {
         let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
@@ -234,6 +256,24 @@ pub fn rasterize(primitives: &[Primitive], width: u32, height: u32, bg: Rgba) ->
                 raster.fill_rect(bounds_tuple(&rect), *c);
             }
         }
+    }
+    raster
+}
+
+/// Rasterize a full page: box primitives first (backgrounds/borders), then text
+/// runs on top (shaped + glyph-rasterized). This is the real render path the
+/// engine uses — `rasterize` alone draws only the box layer.
+pub fn rasterize_page(
+    primitives: &[Primitive],
+    texts: &[TextDraw],
+    width: u32,
+    height: u32,
+    bg: Rgba,
+) -> Raster {
+    let mut raster = rasterize(primitives, width, height, bg);
+    let mut tr = TextRasterizer::new();
+    for run in texts {
+        tr.draw(&mut raster, run);
     }
     raster
 }

@@ -44,6 +44,7 @@ cap-color = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering
 
 cap-geometry = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-geometry" }
 cap-layout = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-layout" }
+cap-text-shape = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-text-shape" }
 cap-http = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-http" }
 
 # --- Internal ---

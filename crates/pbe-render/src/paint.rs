@@ -9,9 +9,10 @@
 
 use cap_geometry::{point, size, Bounds, Pixels};
 use cap_primitives::{Fill, Primitive, RectShape, Rgba as PrimRgba, Shape, ShapePrimitive, Stroke};
-use cap_style_cascade::{ComputedStyle, StyledDom};
+use cap_style_cascade::{ComputedStyle, FontStyle, StyledDom};
 
 use pbe_layout::LayoutResult;
+use pbe_protocol::TextDraw;
 
 fn to_prim_rgba(c: cap_color::Rgba) -> PrimRgba {
     PrimRgba {
@@ -22,13 +23,31 @@ fn to_prim_rgba(c: cap_color::Rgba) -> PrimRgba {
     }
 }
 
-/// Paint a styled DOM using real layout geometry. Returns primitives in paint
-/// order (document order; later = on top).
-pub fn paint_with_layout(styled: &StyledDom, layout: &LayoutResult) -> Vec<Primitive> {
+/// The output of painting: box primitives (backgrounds/borders) and the text
+/// runs to shape + rasterize, both in paint order.
+pub struct Painted {
+    pub primitives: Vec<Primitive>,
+    pub texts: Vec<TextDraw>,
+}
+
+/// Paint a styled DOM using real layout geometry. Returns box primitives and
+/// text draws in paint order (document order; later = on top).
+pub fn paint_with_layout(styled: &StyledDom, layout: &LayoutResult) -> Painted {
     let mut out = Vec::new();
+    let mut texts = Vec::new();
     let mut order = 0u32;
-    paint_node(styled, layout, styled.root(), &mut out, &mut order);
-    out
+    paint_node(
+        styled,
+        layout,
+        styled.root(),
+        &mut out,
+        &mut texts,
+        &mut order,
+    );
+    Painted {
+        primitives: out,
+        texts,
+    }
 }
 
 fn paint_node(
@@ -36,18 +55,59 @@ fn paint_node(
     layout: &LayoutResult,
     id: cap_html_parse::NodeId,
     out: &mut Vec<Primitive>,
+    texts: &mut Vec<TextDraw>,
     order: &mut u32,
 ) {
     if let Some(node) = styled.node(id) {
         if node.is_element() {
-            if let (Some(style), Some(bounds)) = (styled.style(id), layout.bounds(id)) {
-                paint_box(style, &bounds, out, order);
+            if let Some(style) = styled.style(id) {
+                if let Some(bounds) = layout.bounds(id) {
+                    paint_box(style, &bounds, out, order);
+                }
+                // Emit text for this element's direct text children, each at its
+                // own laid-out box, styled by the element's typography.
+                for &child in node.children() {
+                    if let Some(child_node) = styled.node(child) {
+                        if let Some(text) = child_node.text() {
+                            let trimmed = text.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            if let Some(tb) = layout.bounds(child) {
+                                texts.push(text_draw(style, trimmed, &tb));
+                            }
+                        }
+                    }
+                }
             }
         }
         // Recurse in document order so children paint above their parent.
         for &child in node.children() {
-            paint_node(styled, layout, child, out, order);
+            paint_node(styled, layout, child, out, texts, order);
         }
+    }
+}
+
+/// Build a TextDraw from an element's typography and a text box.
+fn text_draw(style: &ComputedStyle, text: &str, bounds: &Bounds<Pixels>) -> TextDraw {
+    let t = &style.typography;
+    let family = t
+        .font_family
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "sans-serif".to_string());
+    TextDraw {
+        text: text.to_string(),
+        x: bounds.origin.x.0,
+        top_y: bounds.origin.y.0,
+        font_size: t.font_size,
+        family,
+        bold: t.font_weight >= 600,
+        italic: matches!(t.font_style, FontStyle::Italic | FontStyle::Oblique),
+        r: t.color.r,
+        g: t.color.g,
+        b: t.color.b,
+        a: t.color.a,
     }
 }
 
@@ -125,10 +185,11 @@ mod tests {
                    .b{width:100px;height:60px;background-color:#00ff00}";
         let styled = StyledDom::new(dom, &[Stylesheet::parse_author(css)]);
         let layout = pbe_layout::layout(&styled, 800.0, 600.0);
-        let prims = paint_with_layout(&styled, &layout);
+        let painted = paint_with_layout(&styled, &layout);
 
         // Two backgrounds painted.
-        let rects: Vec<&ShapePrimitive> = prims
+        let rects: Vec<&ShapePrimitive> = painted
+            .primitives
             .iter()
             .filter_map(|p| match p {
                 Primitive::Shape(s) => Some(s),

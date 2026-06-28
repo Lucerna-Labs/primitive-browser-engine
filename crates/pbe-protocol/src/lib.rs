@@ -84,13 +84,35 @@ impl std::fmt::Debug for StyledReady {
     }
 }
 
-/// The paint result: an ordered list of renderer-neutral primitives, ready to
-/// hand to a sealed rasterizer (`ordo-ux-vello` → `vello::Scene`). Wrapped in an
-/// [`Arc`] for the same cheap-fan-out reason.
+/// One run of text to draw, produced by paint from a text node + its inherited
+/// typography, positioned by real layout. The render stage shapes + rasterizes
+/// it. Plain data so it rides the bus inside [`PaintReady`].
+#[derive(Clone, Debug)]
+pub struct TextDraw {
+    pub text: String,
+    /// Left edge of the text box (logical px, window space).
+    pub x: f32,
+    /// Top edge of the text box; the renderer adds the font ascent to get the
+    /// baseline, so callers don't need font metrics.
+    pub top_y: f32,
+    pub font_size: f32,
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// Text color (0..1 per channel).
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+/// The paint result: renderer-neutral box primitives plus the text runs to
+/// draw, ready for the render off-ramp. Wrapped in [`Arc`] for cheap fan-out.
 #[derive(Clone, Debug)]
 pub struct PaintReady {
     pub label: String,
     pub primitives: Arc<Vec<Primitive>>,
+    pub texts: Arc<Vec<TextDraw>>,
 }
 
 /// The finished frame: the engine's concrete outputs for one render — a
