@@ -72,10 +72,7 @@ fn fill_hex(fill: &Fill) -> Option<u32> {
 }
 
 fn describe(p: &Primitive) -> DisplayItem {
-    let rect = p
-        .bounds()
-        .map(bounds_tuple)
-        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let rect = p.bounds().map(bounds_tuple).unwrap_or((0.0, 0.0, 0.0, 0.0));
     match p {
         Primitive::Shape(s) => {
             let (kind, fill) = match &s.shape {
@@ -86,19 +83,49 @@ fn describe(p: &Primitive) -> DisplayItem {
                 Shape::Line(_) => ("line", None),
                 Shape::Path(p) => ("path", fill_hex(&p.fill)),
             };
-            DisplayItem { kind, order: s.order, rect, fill }
+            DisplayItem {
+                kind,
+                order: s.order,
+                rect,
+                fill,
+            }
         }
-        Primitive::Text(t) => DisplayItem { kind: "text", order: t.order, rect, fill: None },
-        Primitive::Image(i) => DisplayItem { kind: "image", order: i.order, rect, fill: None },
+        Primitive::Text(t) => DisplayItem {
+            kind: "text",
+            order: t.order,
+            rect,
+            fill: None,
+        },
+        Primitive::Image(i) => DisplayItem {
+            kind: "image",
+            order: i.order,
+            rect,
+            fill: None,
+        },
         Primitive::Shadow(s) => DisplayItem {
             kind: "shadow",
             order: s.order,
             rect,
             fill: Some(s.color.to_hex()),
         },
-        Primitive::Clip(_) => DisplayItem { kind: "clip", order: 0, rect, fill: None },
-        Primitive::Layer(_) => DisplayItem { kind: "layer", order: 0, rect, fill: None },
-        Primitive::Transform(_) => DisplayItem { kind: "transform", order: 0, rect, fill: None },
+        Primitive::Clip(_) => DisplayItem {
+            kind: "clip",
+            order: 0,
+            rect,
+            fill: None,
+        },
+        Primitive::Layer(_) => DisplayItem {
+            kind: "layer",
+            order: 0,
+            rect,
+            fill: None,
+        },
+        Primitive::Transform(_) => DisplayItem {
+            kind: "transform",
+            order: 0,
+            rect,
+            fill: None,
+        },
     }
 }
 
@@ -122,7 +149,11 @@ impl Raster {
         for _ in 0..(width * height) {
             pixels.extend_from_slice(&[r, g, b, 255]);
         }
-        Self { width, height, pixels }
+        Self {
+            width,
+            height,
+            pixels,
+        }
     }
 
     /// Alpha-blend a solid color over an axis-aligned rect (clipped to bounds).
@@ -248,7 +279,12 @@ mod tests {
 
     #[test]
     fn rasterize_fills_pixels_inside_and_leaves_bg_outside() {
-        let bg = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        let bg = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
         let raster = rasterize(&[red_rect(0)], 64, 64, bg);
         assert_eq!(raster.pixels.len(), 64 * 64 * 4);
 
@@ -263,7 +299,12 @@ mod tests {
 
     #[test]
     fn ppm_header_and_size_are_correct() {
-        let bg = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        let bg = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
         let ppm = rasterize(&[], 8, 4, bg).to_ppm();
         assert!(ppm.starts_with(b"P6\n8 4\n255\n"));
         // header + 8*4 pixels * 3 bytes

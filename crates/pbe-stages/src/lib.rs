@@ -32,7 +32,12 @@ use pbe_protocol::{
 const FRAME_W: u32 = 800;
 const FRAME_H: u32 = 600;
 /// Opaque white page background.
-const PAGE_BG: cap_primitives::Rgba = cap_primitives::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+const PAGE_BG: cap_primitives::Rgba = cap_primitives::Rgba {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 1.0,
+};
 
 /// Stage 1: source → styled DOM. Wraps parse + cascade.
 pub struct BuildStyledStage;

@@ -100,7 +100,9 @@ fn main() {
     // 2. + 3. Build the web. Stages are restartable specs; the spider supervises.
     let mut bus = Bus::open();
     bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
-    bus.register_spec(StrandSpec::new("build-styled", || Box::new(BuildStyledStage)));
+    bus.register_spec(StrandSpec::new("build-styled", || {
+        Box::new(BuildStyledStage)
+    }));
     bus.register_spec(StrandSpec::new("paint", || Box::new(PaintStage)));
     bus.register_spec(StrandSpec::new("render", || Box::new(RenderStage)));
     bus.register(FrameSink { tx });
@@ -131,7 +133,10 @@ fn main() {
         .join("..")
         .join("out");
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
-        eprintln!("\nERROR: could not create out dir {}: {e}", out_dir.display());
+        eprintln!(
+            "\nERROR: could not create out dir {}: {e}",
+            out_dir.display()
+        );
         std::process::exit(1);
     }
     let dl_path = out_dir.join(format!("{}.display-list.txt", frame.label));
@@ -147,7 +152,14 @@ fn main() {
     }
 
     println!("\n{}", frame.display_list);
-    println!("RESULT: '{}' rendered {} primitive(s) via the bus.", frame.label, frame.primitive_count);
+    println!(
+        "RESULT: '{}' rendered {} primitive(s) via the bus.",
+        frame.label, frame.primitive_count
+    );
     println!("  display list → {}", dl_path.display());
-    println!("  raster (PPM) → {} ({} bytes)", ppm_path.display(), frame.ppm.len());
+    println!(
+        "  raster (PPM) → {} ({} bytes)",
+        ppm_path.display(),
+        frame.ppm.len()
+    );
 }
