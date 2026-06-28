@@ -6,13 +6,16 @@ rendering: don't build a monolithic engine — *compose* one out of dumb math/re
 primitives, drive a sealed rasterizer from outside, and let an orchestrator own
 all the policy.
 
-> **Status (2026-06-28):** renders to pixels, end to end. A render request flows
-> `parse → cascade → paint → render` across the bus as an emergent thread and
-> produces two artifacts: a deterministic **display list** and an actual
-> **rasterized image** (PPM). Verified at the pixel level — a
-> `background-color:#1e2430` box renders as `(30,36,48)` pixels on a white page;
-> outside the box is white. `cargo test` → 4 passed; `cargo run --bin pbe` →
-> writes `out/demo.display-list.txt` + `out/demo.ppm` and exits 0.
+> **Status (2026-06-28):** renders to pixels, end to end, from arbitrary input.
+> A render request flows `parse → cascade → paint → render` across the bus as an
+> emergent thread and produces two artifacts: a deterministic **display list**
+> and an actual **rasterized image** (PPM). The `pbe` CLI renders any HTML/CSS
+> file. Verified zero-warning and pixel-correct:
+> - `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
+> - `cargo fmt --check` → exit 0
+> - `cargo test --workspace` → **6 passed** (4 render unit + 2 full-bus integration)
+> - `cargo run --bin pbe -- examples/sample.html examples/sample.css` → a 480×320
+>   `#2d7d46` box rasterizes to `(45,125,70)` pixels at the origin; outside is white.
 
 ## What this is (and is not)
 
@@ -67,8 +70,14 @@ python tools/ppm_to_png.py out/demo.ppm   # -> out/demo.png
 ## Run
 
 ```sh
-cargo run -p pbe-orchestrator      # or: cargo run --bin pbe
+cargo run --bin pbe                              # the built-in demo page
+cargo run --bin pbe -- page.html                 # render a file (no author CSS)
+cargo run --bin pbe -- page.html page.css        # render HTML + CSS
+cargo run --bin pbe -- examples/sample.html examples/sample.css
 ```
+
+Artifacts land in `out/<label>.display-list.txt` and `out/<label>.ppm`, where
+`<label>` is the HTML file stem (`demo` for the built-in page).
 
 ## <a name="doctrine"></a>Doctrine
 

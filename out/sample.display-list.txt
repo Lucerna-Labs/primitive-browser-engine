@@ -1,0 +1,2 @@
+display-list: 1 item(s)
+  [  0] rect          rect=(   0.0,   0.0  480.0x 320.0) fill=#2d7d46ff

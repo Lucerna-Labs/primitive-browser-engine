@@ -81,18 +81,60 @@ impl Strand for FrameSink {
     }
 }
 
-fn main() {
-    // 1. Fan-out clone fns for our custom payloads.
-    register_render_types();
-
-    // The demo page: source the orchestrator hands to the engine.
-    let request = RenderRequest {
+/// The built-in demo page, used when no input files are given.
+fn demo_request() -> RenderRequest {
+    RenderRequest {
         label: "demo".into(),
         html: "<html><body><div><p>Hello from the primitive browser engine</p></div></body></html>"
             .into(),
         css: "div { background-color: #1e2430; width: 640px; height: 200px; } \
               p { color: #e6e9f0; }"
             .into(),
+    }
+}
+
+/// Build the render request from CLI args.
+///
+/// - `pbe`                       → the built-in demo page
+/// - `pbe <html>`                → render `<html>` (no author CSS)
+/// - `pbe <html> <css>`          → render `<html>` with `<css>`
+///
+/// The label is derived from the HTML file stem so artifacts are named after
+/// the page. Returns an error string on unreadable input.
+fn request_from_args(args: &[String]) -> Result<RenderRequest, String> {
+    match args {
+        [] => Ok(demo_request()),
+        [html_path, rest @ ..] => {
+            let html = std::fs::read_to_string(html_path)
+                .map_err(|e| format!("cannot read HTML '{html_path}': {e}"))?;
+            let css = match rest.first() {
+                Some(css_path) => std::fs::read_to_string(css_path)
+                    .map_err(|e| format!("cannot read CSS '{css_path}': {e}"))?,
+                None => String::new(),
+            };
+            let label = std::path::Path::new(html_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("page")
+                .to_string();
+            Ok(RenderRequest { label, html, css })
+        }
+    }
+}
+
+fn main() {
+    // 1. Fan-out clone fns for our custom payloads.
+    register_render_types();
+
+    // Resolve the page to render from CLI args (built-in demo if none).
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    let request = match request_from_args(&cli) {
+        Ok(req) => req,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            eprintln!("usage: pbe [<html-file> [<css-file>]]");
+            std::process::exit(2);
+        }
     };
 
     let (tx, rx) = mpsc::channel::<FrameReady>();
