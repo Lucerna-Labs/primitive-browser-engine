@@ -1,0 +1,18 @@
+[package]
+name = "pbe-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The primitive browser engine orchestrator — all policy, no mechanism. Registers stages + the spider on the bus and runs renders."
+
+[[bin]]
+name = "pbe"
+path = "src/main.rs"
+
+[dependencies]
+spiderweb = { workspace = true }
+spider = { workspace = true }
+pbe-protocol = { workspace = true }
+pbe-stages = { workspace = true }
+cap-primitives = { workspace = true }

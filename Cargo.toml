@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pbe-protocol",
+    "crates/pbe-stages",
+    "crates/pbe-orchestrator",
+]
+
+# ---------------------------------------------------------------------------
+# Primitive Browser Engine — an orchestrator that composes an existing,
+# dumb math/render primitive kit over the Spiderweb bus.
+#
+# Doctrine (composition, not cracking):
+#   - The primitive kit (F:\browser primitves + the cap-* store crates) holds
+#     ALL mechanism. We never modify it; we drive it from outside.
+#   - The Spiderweb bus (D:\Spiderweb-Bus-Next) is the fabric the stages talk
+#     over. We never modify it either.
+#   - THIS workspace is the orchestrator: all policy, no mechanism. Each render
+#     stage is a Strand wrapping a dumb primitive function; a page render is a
+#     thread that emerges as typed messages flow through the fabric.
+# ---------------------------------------------------------------------------
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.91"
+
+[workspace.dependencies]
+# --- The bus (drive from outside, never modified) ---
+spiderweb = { path = "D:/Spiderweb-Bus-Next/crates/spiderweb" }
+spider = { path = "D:/Spiderweb-Bus-Next/crates/spider" }
+
+# --- The render primitive kit (drive from outside, never modified) ---
+cap-html-parse = { path = "F:/browser primitves/crates/cap-html-parse" }
+cap-css-parse = { path = "F:/browser primitves/crates/cap-css-parse" }
+cap-style-cascade = { path = "F:/browser primitves/crates/cap-style-cascade" }
+cap-paint = { path = "F:/browser primitves/crates/cap-paint" }
+cap-primitives = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-primitives" }
+
+# --- Internal ---
+pbe-protocol = { path = "crates/pbe-protocol" }
+pbe-stages = { path = "crates/pbe-stages" }
