@@ -1,0 +1,20 @@
+[package]
+name = "pbe-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Windowed browser shell — presents the engine's rendered frames in a real OS window with scroll, resize, and reload."
+
+[[bin]]
+name = "pbe-window"
+path = "src/main.rs"
+
+[dependencies]
+pbe-stages = { workspace = true }
+pbe-net = { workspace = true }
+# Real OS window + event loop, and a CPU framebuffer presenter (the engine's
+# software rasterizer already produces RGBA, so softbuffer blits it directly —
+# no GPU dependency for this milestone).
+winit = "0.30"
+softbuffer = "0.4"

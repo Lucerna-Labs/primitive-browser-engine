@@ -204,6 +204,16 @@ impl Raster {
         self.pixels[i + 3] = 255;
     }
 
+    /// Consume the framebuffer and return its raw RGBA8 bytes (row-major).
+    pub fn into_rgba(self) -> Vec<u8> {
+        self.pixels
+    }
+
+    /// Borrow the raw RGBA8 bytes.
+    pub fn rgba(&self) -> &[u8] {
+        &self.pixels
+    }
+
     /// Serialize as a binary PPM (P6) image — readable by most image viewers.
     pub fn to_ppm(&self) -> Vec<u8> {
         let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
@@ -258,6 +268,33 @@ pub fn rasterize(primitives: &[Primitive], width: u32, height: u32, bg: Rgba) ->
         }
     }
     raster
+}
+
+/// Return a copy of `primitives` translated by `(dx, dy)` — used by the
+/// windowed shell to apply vertical scroll without recomputing layout. Only the
+/// shape variants the engine emits (rects) are translated; others pass through.
+pub fn translate_primitives(primitives: &[Primitive], dx: f32, dy: f32) -> Vec<Primitive> {
+    use cap_geometry::{point, Pixels};
+    let shift = |b: &Bounds<Pixels>| -> Bounds<Pixels> {
+        Bounds::new(
+            point(Pixels(b.origin.x.0 + dx), Pixels(b.origin.y.0 + dy)),
+            b.size,
+        )
+    };
+    primitives
+        .iter()
+        .map(|p| match p {
+            Primitive::Shape(s) => {
+                let mut s = s.clone();
+                s.bounds = shift(&s.bounds);
+                if let Shape::Rect(r) = &mut s.shape {
+                    r.rect = shift(&r.rect);
+                }
+                Primitive::Shape(s)
+            }
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Rasterize a full page: box primitives first (backgrounds/borders), then text

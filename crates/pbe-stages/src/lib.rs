@@ -326,6 +326,59 @@ pub fn extract_style_blocks(html: &str) -> String {
     out
 }
 
+/// Combine the UA stylesheet, the page's embedded `<style>` CSS, and any
+/// caller-supplied author CSS, in cascade-precedence order (UA lowest).
+pub fn build_combined_css(html: &str, author_css: &str) -> String {
+    let embedded = extract_style_blocks(html);
+    let mut css = String::from(USER_AGENT_CSS);
+    if !embedded.is_empty() {
+        css.push('\n');
+        css.push_str(&embedded);
+    }
+    if !author_css.trim().is_empty() {
+        css.push('\n');
+        css.push_str(author_css);
+    }
+    css
+}
+
+/// Synchronous full render: HTML + author CSS → an RGBA8 framebuffer of size
+/// `w`×`h` with vertical scroll `scroll_y` (pixels). This is the same pipeline
+/// the bus stages run (parse → cascade → layout → paint → rasterize), exposed
+/// as one call for the windowed shell, which renders on demand rather than via
+/// the one-shot bus. Returns `(rgba_bytes, content_height)`.
+pub fn render_to_rgba(
+    html: &str,
+    author_css: &str,
+    w: u32,
+    h: u32,
+    scroll_y: f32,
+) -> (Vec<u8>, f32) {
+    let dom = cap_html_parse::parse_html(html);
+    let css = build_combined_css(html, author_css);
+    let sheet = cap_css_parse::Stylesheet::parse_author(&css);
+    let styled = cap_style_cascade::StyledDom::new(dom, &[sheet]);
+
+    let layout = pbe_layout::layout(&styled, w as f32, h as f32);
+    let content_height = layout.content_height();
+    let painted = pbe_render::paint_with_layout(&styled, &layout);
+
+    // Apply scroll by shifting paint/text up by scroll_y.
+    let primitives = pbe_render::translate_primitives(&painted.primitives, 0.0, -scroll_y);
+    let texts: Vec<pbe_protocol::TextDraw> = painted
+        .texts
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            t.top_y -= scroll_y;
+            t
+        })
+        .collect();
+
+    let raster = pbe_render::rasterize_page(&primitives, &texts, w, h, PAGE_BG);
+    (raster.into_rgba(), content_height)
+}
+
 /// Register the render payload types for bus fan-out. Must be called once at
 /// boot before the bus runs — the kernel needs a clone fn per custom type.
 pub fn register_render_types() {

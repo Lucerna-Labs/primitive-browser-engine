@@ -46,6 +46,15 @@ impl LayoutResult {
     pub fn is_empty(&self) -> bool {
         self.boxes.is_empty()
     }
+
+    /// The total content height: the largest box bottom edge. Used for scroll
+    /// extent in the windowed shell.
+    pub fn content_height(&self) -> f32 {
+        self.boxes
+            .values()
+            .map(|b| b.origin.y.0 + b.size.height.0)
+            .fold(0.0_f32, f32::max)
+    }
 }
 
 /// Approximate average glyph advance as a fraction of font size, used to give
