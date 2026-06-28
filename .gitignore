@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 Cargo.lock
+
+# Generated render artifacts
+/out/*.ppm
+/out/*.png

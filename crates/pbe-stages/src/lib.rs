@@ -24,9 +24,15 @@ use std::sync::Arc;
 use spiderweb::{BusHandle, Socket, Strand, StrandError};
 
 use pbe_protocol::{
-    PaintReady, RenderRequest, StyledReady, SOCK_PAINT_READY, SOCK_RENDER_REQUEST,
-    SOCK_STYLED_READY,
+    FrameReady, PaintReady, RenderRequest, StyledReady, SOCK_FRAME_READY, SOCK_PAINT_READY,
+    SOCK_RENDER_REQUEST, SOCK_STYLED_READY,
 };
+
+/// Default frame size for the render off-ramp (CSS px == device px for now).
+const FRAME_W: u32 = 800;
+const FRAME_H: u32 = 600;
+/// Opaque white page background.
+const PAGE_BG: cap_primitives::Rgba = cap_primitives::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 
 /// Stage 1: source → styled DOM. Wraps parse + cascade.
 pub struct BuildStyledStage;
@@ -111,10 +117,60 @@ impl Strand for PaintStage {
     }
 }
 
+/// Stage 3: primitive list → finished frame. Wraps `pbe_render` (display list +
+/// software raster). This is the render off-ramp — the sealed-rasterizer-from-
+/// outside step, swappable for a GPU backend later.
+pub struct RenderStage;
+
+impl Strand for RenderStage {
+    fn name(&self) -> &str {
+        "render"
+    }
+
+    fn inputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<PaintReady>(SOCK_PAINT_READY);
+        std::slice::from_ref(&S)
+    }
+
+    fn outputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<FrameReady>(SOCK_FRAME_READY);
+        std::slice::from_ref(&S)
+    }
+
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        for done in bus.recv::<PaintReady>(SOCK_PAINT_READY)? {
+            let display_list = pbe_render::display_list(&done.primitives);
+            let raster = pbe_render::rasterize(&done.primitives, FRAME_W, FRAME_H, PAGE_BG);
+            let ppm = raster.to_ppm();
+            bus.log(&format!(
+                "{}: rendered {}x{} frame ({} bytes PPM)",
+                done.label,
+                FRAME_W,
+                FRAME_H,
+                ppm.len()
+            ));
+            bus.publish_static(
+                SOCK_FRAME_READY,
+                FrameReady {
+                    label: done.label,
+                    primitive_count: done.primitives.len(),
+                    display_list,
+                    width: FRAME_W,
+                    height: FRAME_H,
+                    ppm: Arc::new(ppm),
+                },
+            )?;
+        }
+        bus.sleep(std::time::Duration::from_millis(10));
+        Ok(())
+    }
+}
+
 /// Register the render payload types for bus fan-out. Must be called once at
 /// boot before the bus runs — the kernel needs a clone fn per custom type.
 pub fn register_render_types() {
     spiderweb::register_clone_type::<RenderRequest>();
     spiderweb::register_clone_type::<StyledReady>();
     spiderweb::register_clone_type::<PaintReady>();
+    spiderweb::register_clone_type::<FrameReady>();
 }

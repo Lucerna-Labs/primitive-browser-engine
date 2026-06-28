@@ -11,14 +11,24 @@
       as an emergent thread; `paint` produces a primitive list. Clean build
       (only pre-existing `cap-html-parse` warnings), `RUN_EXIT=0`.
 
+## Done (2026-06-28) — Render to pixels
+
+- [x] `pbe-render`: paint primitive list → deterministic display list + software
+      raster (RGBA framebuffer → PPM). Zero GPU dep. 4 unit tests.
+- [x] `render` strand wired as the 4th stage; orchestrator writes
+      `out/demo.display-list.txt` + `out/demo.ppm`.
+- [x] **Pixel-verified:** the `#1e2430` 640×200 box renders as `(30,36,48)`
+      pixels at the top-left; outside is white. PNG preview confirmed visually.
+- [x] `tools/ppm_to_png.py` — stdlib-only PPM→PNG for viewing.
+
 ## Next
 
-### 1. Render the primitives (close the pipeline to pixels)
-Wire `ordo-ux-vello` so `PaintReady` → `vello::Scene` → a real raster (PNG to
-start, window later). **Seam:** the kit has *two* primitive vocabularies —
-`cap_paint` emits `cap_primitives::Primitive`, but `ordo-ux-vello` consumes
-`ordo-ux-primitives::Primitive`. Needs a small bridge crate (`pbe-render`?) or a
-converter. Pure composition; no engine changes.
+### 1. GPU backend via `ordo-ux-vello` (swap the render stage)
+Replace/augment the software rasterizer with `ordo-ux-vello` → `vello::Scene` →
+GPU. **Seam:** the kit has *two* primitive vocabularies — `cap_paint` emits
+`cap_primitives::Primitive`, but `ordo-ux-vello` consumes
+`ordo-ux-primitives::Primitive`. Needs a converter. Pure composition; no engine
+changes. (The software path stays as the headless/test backend.)
 
 ### 2. Split parse and cascade into separate strands
 Today they fuse in `build-styled` because `StyledDom::new` **consumes** the

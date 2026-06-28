@@ -9,8 +9,10 @@ description = "Render stages as Spiderweb strands — each wraps a dumb cap-* pr
 [dependencies]
 spiderweb = { workspace = true }
 pbe-protocol = { workspace = true }
+pbe-render = { workspace = true }
 
 cap-html-parse = { workspace = true }
 cap-css-parse = { workspace = true }
 cap-style-cascade = { workspace = true }
 cap-paint = { workspace = true }
+cap-primitives = { workspace = true }

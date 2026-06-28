@@ -1,0 +1,11 @@
+[package]
+name = "pbe-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Render off-ramp — turns a paint primitive list into a deterministic display list (the engine's inspectable output) and a PPM raster."
+
+[dependencies]
+cap-primitives = { workspace = true }
+cap-geometry = { workspace = true }

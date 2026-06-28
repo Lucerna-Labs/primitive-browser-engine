@@ -6,10 +6,13 @@ rendering: don't build a monolithic engine — *compose* one out of dumb math/re
 primitives, drive a sealed rasterizer from outside, and let an orchestrator own
 all the policy.
 
-> **Status (2026-06-28):** end-to-end skeleton runs. A render request flows
-> `parse → cascade → paint` across the bus as an emergent thread and returns a
-> primitive list. Verified: `cargo run -p pbe-orchestrator` →
-> *"'demo' produced 1 render primitive(s) via the bus."*
+> **Status (2026-06-28):** renders to pixels, end to end. A render request flows
+> `parse → cascade → paint → render` across the bus as an emergent thread and
+> produces two artifacts: a deterministic **display list** and an actual
+> **rasterized image** (PPM). Verified at the pixel level — a
+> `background-color:#1e2430` box renders as `(30,36,48)` pixels on a white page;
+> outside the box is white. `cargo test` → 4 passed; `cargo run --bin pbe` →
+> writes `out/demo.display-list.txt` + `out/demo.ppm` and exits 0.
 
 ## What this is (and is not)
 
@@ -26,8 +29,8 @@ reusable primitive crates, and we drive them from outside without modifying them
 ## Architecture
 
 ```text
- RenderRequest ──▶ [build-styled] ──▶ StyledReady ──▶ [paint] ──▶ PaintReady
-   (on-ramp)        parse+cascade                       paint        (off-ramp)
+ RenderRequest ─▶ [build-styled] ─▶ StyledReady ─▶ [paint] ─▶ PaintReady ─▶ [render] ─▶ FrameReady
+   (on-ramp)       parse+cascade                    paint                    rasterize    (off-ramp)
 ```
 
 Each box is a **strand** (a bus worker) wrapping a dumb primitive function. Each
@@ -42,10 +45,24 @@ fan across parallel lanes.
   `PaintReady`) and socket names. Pure contracts. Heavy payloads ride as
   `Arc<T>` so bus fan-out is a refcount bump, never a deep DOM copy (explicit,
   near-zero cost — the doctrine forbids invisible cost).
-- **`pbe-stages`** — the render stages as strands. The only new code in the
-  render path; each just adapts a `cap-*` call to the bus. No policy.
+- **`pbe-stages`** — the render stages as strands (`build-styled`, `paint`,
+  `render`). The only new code in the render path; each just adapts a `cap-*` or
+  `pbe-render` call to the bus. No policy.
+- **`pbe-render`** — the render off-ramp: turns a paint primitive list into a
+  deterministic display list (golden-testable) and a software-rasterized RGBA
+  framebuffer serialized as PPM. Zero GPU dependency — a GPU backend
+  (`ordo-ux-vello`) is a *swap* of this stage later, not a prerequisite.
 - **`pbe-orchestrator`** (`pbe` binary) — registers types, stages, and the
-  spider; dispatches a demo render; reports the result. All policy.
+  spider; dispatches a demo render; writes artifacts to `out/`. All policy.
+
+## Viewing the raster
+
+The engine writes a binary PPM. To view it as PNG:
+
+```sh
+cargo run --bin pbe                       # writes out/demo.ppm + out/demo.display-list.txt
+python tools/ppm_to_png.py out/demo.ppm   # -> out/demo.png
+```
 
 ## Run
 

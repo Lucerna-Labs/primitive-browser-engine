@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pbe-protocol",
+    "crates/pbe-render",
     "crates/pbe-stages",
     "crates/pbe-orchestrator",
 ]
@@ -38,6 +39,9 @@ cap-style-cascade = { path = "F:/browser primitves/crates/cap-style-cascade" }
 cap-paint = { path = "F:/browser primitves/crates/cap-paint" }
 cap-primitives = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-primitives" }
 
+cap-geometry = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-geometry" }
+
 # --- Internal ---
 pbe-protocol = { path = "crates/pbe-protocol" }
+pbe-render = { path = "crates/pbe-render" }
 pbe-stages = { path = "crates/pbe-stages" }

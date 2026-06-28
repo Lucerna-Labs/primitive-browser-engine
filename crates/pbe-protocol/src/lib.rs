@@ -36,6 +36,8 @@ pub const SOCK_RENDER_REQUEST: &str = "render.request";
 pub const SOCK_STYLED_READY: &str = "render.styled";
 /// Socket: paint is complete — a primitive list is ready for the renderer.
 pub const SOCK_PAINT_READY: &str = "render.paint";
+/// Socket: the render off-ramp is done — display list + raster are ready.
+pub const SOCK_FRAME_READY: &str = "render.frame";
 
 /// A request to render a page from source. This is the on-ramp payload an
 /// orchestrator (or a fetch stage) publishes to kick off a render.
@@ -76,6 +78,32 @@ impl std::fmt::Debug for StyledReady {
 pub struct PaintReady {
     pub label: String,
     pub primitives: Arc<Vec<Primitive>>,
+}
+
+/// The finished frame: the engine's concrete outputs for one render — a
+/// deterministic display list (text) and a rasterized image (binary PPM bytes),
+/// plus the painted-primitive count. This is what the render off-ramp emits and
+/// the orchestrator writes to disk / hands onward.
+#[derive(Clone)]
+pub struct FrameReady {
+    pub label: String,
+    pub primitive_count: usize,
+    pub display_list: String,
+    pub width: u32,
+    pub height: u32,
+    /// Rasterized frame as binary PPM (P6) bytes.
+    pub ppm: Arc<Vec<u8>>,
+}
+
+impl std::fmt::Debug for FrameReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameReady")
+            .field("label", &self.label)
+            .field("primitive_count", &self.primitive_count)
+            .field("size", &(self.width, self.height))
+            .field("ppm_bytes", &self.ppm.len())
+            .finish()
+    }
 }
 
 /// A tiny helper so [`DomTree`] is part of the public surface here — the
