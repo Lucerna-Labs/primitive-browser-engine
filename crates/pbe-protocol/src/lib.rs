@@ -30,6 +30,8 @@ use cap_html_parse::DomTree;
 use cap_primitives::Primitive;
 use cap_style_cascade::StyledDom;
 
+/// Socket: a request to fetch a URL from the network (the on-ramp for live web).
+pub const SOCK_FETCH_REQUEST: &str = "fetch.request";
 /// Socket: a request to render a page. Carries the raw HTML + CSS source.
 pub const SOCK_RENDER_REQUEST: &str = "render.request";
 /// Socket: a styled DOM is ready (parse + cascade complete).
@@ -38,6 +40,17 @@ pub const SOCK_STYLED_READY: &str = "render.styled";
 pub const SOCK_PAINT_READY: &str = "render.paint";
 /// Socket: the render off-ramp is done — display list + raster are ready.
 pub const SOCK_FRAME_READY: &str = "render.frame";
+
+/// A request to fetch a live URL over the network. The `fetch` stage loads it
+/// and publishes a [`RenderRequest`] with the page's HTML, so the same render
+/// pipeline serves both local files and the live web. Optional `css` lets the
+/// caller supply an author/override stylesheet alongside the fetched HTML.
+#[derive(Clone, Debug)]
+pub struct FetchRequest {
+    pub url: String,
+    /// Optional CSS to apply on top of the fetched page (often empty).
+    pub css: String,
+}
 
 /// A request to render a page from source. This is the on-ramp payload an
 /// orchestrator (or a fetch stage) publishes to kick off a render.

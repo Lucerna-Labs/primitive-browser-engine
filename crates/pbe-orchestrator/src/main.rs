@@ -19,8 +19,11 @@ use std::time::Duration;
 use spider::Spider;
 use spiderweb::{Bus, BusHandle, Socket, Strand, StrandError, StrandSpec};
 
-use pbe_protocol::{FrameReady, RenderRequest, SOCK_FRAME_READY, SOCK_RENDER_REQUEST};
-use pbe_stages::{register_render_types, BuildStyledStage, PaintStage, RenderStage};
+use pbe_protocol::{
+    FetchRequest, FrameReady, RenderRequest, SOCK_FETCH_REQUEST, SOCK_FRAME_READY,
+    SOCK_RENDER_REQUEST,
+};
+use pbe_stages::{register_render_types, BuildStyledStage, FetchStage, PaintStage, RenderStage};
 
 /// A one-shot source strand: publishes a single [`RenderRequest`] on its first
 /// tick, then detaches. This is the on-ramp that starts the render thread.
@@ -44,6 +47,35 @@ impl Strand for RequestSource {
             Some(req) => {
                 bus.log(&format!("dispatching render: {}", req.label));
                 bus.publish_static(SOCK_RENDER_REQUEST, req)?;
+                Err(StrandError::Detach) // one-shot
+            }
+            None => Err(StrandError::Detach),
+        }
+    }
+}
+
+/// A one-shot source strand that publishes a single [`FetchRequest`] (the
+/// network on-ramp), then detaches. Used for `--url` mode.
+struct UrlSource {
+    request: Option<FetchRequest>,
+}
+
+impl Strand for UrlSource {
+    fn name(&self) -> &str {
+        "url-source"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<FetchRequest>(SOCK_FETCH_REQUEST);
+        std::slice::from_ref(&S)
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        match self.request.take() {
+            Some(req) => {
+                bus.log(&format!("dispatching fetch: {}", req.url));
+                bus.publish_static(SOCK_FETCH_REQUEST, req)?;
                 Err(StrandError::Detach) // one-shot
             }
             None => Err(StrandError::Detach),
@@ -93,17 +125,36 @@ fn demo_request() -> RenderRequest {
     }
 }
 
-/// Build the render request from CLI args.
+/// What kind of on-ramp the CLI selected.
+enum Source {
+    /// Render local source directly (built-in demo or files).
+    Local(RenderRequest),
+    /// Fetch a live URL first (network on-ramp), then render it.
+    Url(FetchRequest),
+}
+
+/// Build the on-ramp from CLI args.
 ///
-/// - `pbe`                       → the built-in demo page
-/// - `pbe <html>`                → render `<html>` (no author CSS)
-/// - `pbe <html> <css>`          → render `<html>` with `<css>`
+/// - `pbe`                        → the built-in demo page
+/// - `pbe --url <URL> [<css>]`    → fetch + render a live page (optional CSS file)
+/// - `pbe <html> [<css>]`         → render local file(s)
 ///
-/// The label is derived from the HTML file stem so artifacts are named after
-/// the page. Returns an error string on unreadable input.
-fn request_from_args(args: &[String]) -> Result<RenderRequest, String> {
+/// Returns an error string on unreadable input.
+fn source_from_args(args: &[String]) -> Result<Source, String> {
     match args {
-        [] => Ok(demo_request()),
+        [] => Ok(Source::Local(demo_request())),
+        [flag, url, rest @ ..] if flag == "--url" => {
+            let css = match rest.first() {
+                Some(css_path) => std::fs::read_to_string(css_path)
+                    .map_err(|e| format!("cannot read CSS '{css_path}': {e}"))?,
+                None => String::new(),
+            };
+            Ok(Source::Url(FetchRequest {
+                url: url.clone(),
+                css,
+            }))
+        }
+        [flag] if flag == "--url" => Err("--url requires a URL argument".into()),
         [html_path, rest @ ..] => {
             let html = std::fs::read_to_string(html_path)
                 .map_err(|e| format!("cannot read HTML '{html_path}': {e}"))?;
@@ -117,7 +168,7 @@ fn request_from_args(args: &[String]) -> Result<RenderRequest, String> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("page")
                 .to_string();
-            Ok(RenderRequest { label, html, css })
+            Ok(Source::Local(RenderRequest { label, html, css }))
         }
     }
 }
@@ -126,35 +177,54 @@ fn main() {
     // 1. Fan-out clone fns for our custom payloads.
     register_render_types();
 
-    // Resolve the page to render from CLI args (built-in demo if none).
+    // Resolve the on-ramp from CLI args (built-in demo if none).
     let cli: Vec<String> = std::env::args().skip(1).collect();
-    let request = match request_from_args(&cli) {
-        Ok(req) => req,
+    let source = match source_from_args(&cli) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("ERROR: {e}");
-            eprintln!("usage: pbe [<html-file> [<css-file>]]");
+            eprintln!("usage: pbe [<html-file> [<css-file>]] | pbe --url <URL> [<css-file>]");
             std::process::exit(2);
         }
+    };
+    // A network fetch needs longer than a local render.
+    let is_url = matches!(source, Source::Url(_));
+    let budget = if is_url {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(3)
     };
 
     let (tx, rx) = mpsc::channel::<FrameReady>();
 
     // 2. + 3. Build the web. Stages are restartable specs; the spider supervises.
+    // The fetch stage (network on-ramp) is always present; it only does work
+    // when a FetchRequest flows, so it is harmless for local renders.
     let mut bus = Bus::open();
     bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
+    bus.register_spec(StrandSpec::new("fetch", || Box::new(FetchStage)));
     bus.register_spec(StrandSpec::new("build-styled", || {
         Box::new(BuildStyledStage)
     }));
     bus.register_spec(StrandSpec::new("paint", || Box::new(PaintStage)));
     bus.register_spec(StrandSpec::new("render", || Box::new(RenderStage)));
     bus.register(FrameSink { tx });
-    bus.register(RequestSource {
-        request: Some(request),
-    });
+    match source {
+        Source::Local(request) => {
+            bus.register(RequestSource {
+                request: Some(request),
+            });
+        }
+        Source::Url(request) => {
+            bus.register(UrlSource {
+                request: Some(request),
+            });
+        }
+    }
 
     // 4. Run until the render thread completes (or a safety timeout).
     println!("── primitive browser engine: composing cap-* kit over the spiderweb bus ──");
-    bus.run_until(Some(Duration::from_secs(3)));
+    bus.run_until(Some(budget));
 
     let frame = match rx.try_recv() {
         Ok(frame) => frame,
@@ -164,9 +234,19 @@ fn main() {
         }
     };
 
+    // A valid frame with 0 primitives is NOT a failure — it means the page had
+    // nothing the current (MVP) `cap-paint` knows how to draw. cap-paint only
+    // emits primitives for elements with a non-transparent background or border;
+    // text and real box layout are not yet implemented in the kit, so a
+    // text-only page (e.g. example.com) legitimately paints nothing. Report it
+    // honestly and still persist the (blank-but-valid) frame.
     if frame.primitive_count == 0 {
-        eprintln!("\nwarning: 0 primitives — pipeline ran but painted nothing.");
-        std::process::exit(1);
+        eprintln!(
+            "\nNOTE: 0 paint primitives — the page parsed and rendered a valid {}x{} frame, \
+             but cap-paint (MVP) only draws backgrounds/borders; text + layout are not yet \
+             implemented in the kit, so a text-only page appears blank.",
+            frame.width, frame.height
+        );
     }
 
     // 5. Persist the engine's artifacts.
@@ -181,8 +261,26 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let dl_path = out_dir.join(format!("{}.display-list.txt", frame.label));
-    let ppm_path = out_dir.join(format!("{}.ppm", frame.label));
+    // The label may be a URL (slashes, colons) — sanitize for a filename.
+    let safe_label: String = frame
+        .label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_label = safe_label.trim_matches('_').to_string();
+    let safe_label = if safe_label.is_empty() {
+        "page".to_string()
+    } else {
+        safe_label
+    };
+    let dl_path = out_dir.join(format!("{safe_label}.display-list.txt"));
+    let ppm_path = out_dir.join(format!("{safe_label}.ppm"));
 
     if let Err(e) = std::fs::write(&dl_path, &frame.display_list) {
         eprintln!("\nERROR: could not write {}: {e}", dl_path.display());

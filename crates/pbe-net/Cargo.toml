@@ -1,0 +1,10 @@
+[package]
+name = "pbe-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Network on-ramp — fetches a URL by driving the SEALED system curl binary from outside (std::process only). Zero linked network/crypto dependencies; minimal immutable attack surface."
+
+[dependencies]
+cap-http = { workspace = true }

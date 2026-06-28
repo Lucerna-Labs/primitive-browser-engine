@@ -32,9 +32,31 @@ reusable primitive crates, and we drive them from outside without modifying them
 ## Architecture
 
 ```text
- RenderRequest ─▶ [build-styled] ─▶ StyledReady ─▶ [paint] ─▶ PaintReady ─▶ [render] ─▶ FrameReady
-   (on-ramp)       parse+cascade                    paint                    rasterize    (off-ramp)
+ FetchRequest ─▶ [fetch] ─▶ RenderRequest ─▶ [build-styled] ─▶ StyledReady ─▶ [paint] ─▶ PaintReady ─▶ [render] ─▶ FrameReady
+  (URL on-ramp)   HTTPS       (or local src)   parse+cascade                   paint                    rasterize    (off-ramp)
 ```
+
+The `fetch` stage is the **network on-ramp**: a `--url` request is fetched over
+HTTPS and turned into a `RenderRequest`, so the same pipeline renders both local
+files and the live web.
+
+### Security posture — networking by composition, not by linking
+
+The engine **links no HTTP or TLS code**. The `pbe-net` crate drives the
+**sealed system `curl` binary** from outside via `std::process` (the same way the
+Spiderweb bus reaches encrypted transport through the system `ssh` rather than
+reimplementing crypto). Consequences:
+
+- **Zero linked network/crypto dependencies** — `cargo tree -p pbe-net` is just
+  the `cap-http` *type contract* (+ smallvec/thiserror). Nothing to audit, no
+  TLS/parser CVE in our address space.
+- **Process isolation** — the network touches a separate sealed process; the
+  engine only ever receives bytes over a pipe. The fetch boundary is an OS
+  process boundary, not a call into mutable foreign code.
+- **Scheme allow-list** — only `http`/`https` reach curl (`--proto =http,https`
+  plus a pre-spawn check); no `file://`, `scp://`, etc.
+- **Immutable values** — a fetched page is a plain owned struct; the fetch
+  primitive is a pure `url -> Result<FetchedPage>` with no shared state.
 
 Each box is a **strand** (a bus worker) wrapping a dumb primitive function. Each
 arrow is a **typed socket**. No stage names another stage — the bus fans out by
@@ -71,10 +93,16 @@ python tools/ppm_to_png.py out/demo.ppm   # -> out/demo.png
 
 ```sh
 cargo run --bin pbe                              # the built-in demo page
-cargo run --bin pbe -- page.html                 # render a file (no author CSS)
-cargo run --bin pbe -- page.html page.css        # render HTML + CSS
+cargo run --bin pbe -- page.html                 # render a local file (no author CSS)
+cargo run --bin pbe -- page.html page.css        # render local HTML + CSS
 cargo run --bin pbe -- examples/sample.html examples/sample.css
+cargo run --bin pbe -- --url https://example.com # fetch + render a LIVE page
+cargo run --bin pbe -- --url https://example.com extra.css   # live page + override CSS
 ```
+
+Embedded `<style>` blocks in the (fetched or local) HTML are extracted and
+applied automatically, so a page styles itself; an optional CSS file layers on
+top.
 
 Artifacts land in `out/<label>.display-list.txt` and `out/<label>.ppm`, where
 `<label>` is the HTML file stem (`demo` for the built-in page).

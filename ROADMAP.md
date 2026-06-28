@@ -55,13 +55,39 @@ Long-term, this becomes the `aegis-render` in-process backend behind the
 `BrowserBackend` trait in `C:\Projects\aegis-browser` — replacing the Servo
 WebDriver backend with direct Rust calls. (See that project's DESIGN.md §2/§6.5.)
 
+## Done (2026-06-28) — Internet capability (fetch the live web)
+
+- [x] `pbe-net`: fetch a URL by driving the **sealed system `curl`** via
+      `std::process` — zero linked HTTP/TLS deps (composition, not a fat crate).
+      Scheme allow-list (http/https only), process isolation, immutable output.
+      `cargo tree -p pbe-net` = just the cap-http contract + smallvec/thiserror.
+- [x] `fetch` stage (network on-ramp): `FetchRequest` → fetch → `RenderRequest`,
+      so the same pipeline renders local files AND the live web.
+- [x] CLI `--url <URL> [<css>]`; URL labels sanitized for artifact filenames.
+- [x] `<style>` extraction in build-styled: embedded page CSS is recovered and
+      cascaded (a page now styles itself; was previously ignored).
+- [x] Honest exit semantics: a valid frame with 0 paint primitives is success
+      with a NOTE (cap-paint MVP limitation), not a failure.
+- [x] **Verified live:** fetched a local HTTP page over the network → extracted
+      its `<style>` (#c81e3a 500x260 box) → painted 1 primitive → rasterized;
+      PNG confirms a crimson box. example.com/rust-lang.org fetch+parse also
+      verified (242 elements parsed from rust-lang.org).
+- [x] 13 tests pass (2 pbe-net + 4 pbe-render + 5 pbe-stages + 2 integration).
+
+### Known limit (kit depth, not engine wiring)
+Text and real box layout are not implemented in `cap-paint`/`cap-style-cascade`
+(MVP): paint only emits primitives for elements with a background/border, and
+bounds are origin-anchored placeholders. So text-heavy live pages (example.com)
+parse fully but paint little. Closing this is kit work (needs approval to edit
+F: crates) or a richer paint stage in `pbe-render` — tracked under "Next".
+
 ## Build hygiene
 
-Zero-warning build, verified 2026-06-28:
+Zero-warning build, verified 2026-06-28 (after internet capability landed):
 - `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
 - `cargo fmt --check` (pbe-* crates) → exit 0
-- `cargo test --workspace` → 4 passed
-- `cargo build --release` + `cargo run --release --bin pbe` → exit 0, no warnings
+- `cargo test --workspace` → 13 passed
+- `cargo build --release` + live `--url` run → exit 0, no warnings
 
 The lone prior warnings were dead-code on the `HtmlTreeSink` placeholder in
 `cap-html-parse` (the F: kit). Fixed at the source with `#[allow(dead_code)]`
