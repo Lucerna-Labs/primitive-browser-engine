@@ -1,0 +1,8 @@
+[package]
+name = "pmre-core"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Geometry, paint, framebuffer, and fair-queue primitives for PMRE."
+
+[dependencies]

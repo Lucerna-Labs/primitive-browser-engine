@@ -11,8 +11,9 @@ name = "pbe-window"
 path = "src/main.rs"
 
 [dependencies]
-pbe-stages = { workspace = true }
 pbe-net = { workspace = true }
+pmre-kit = { workspace = true }
+pmre-orchestrator = { workspace = true }
 # Real OS window + event loop, and a CPU framebuffer presenter (the engine's
 # software rasterizer already produces RGBA, so softbuffer blits it directly —
 # no GPU dependency for this milestone).

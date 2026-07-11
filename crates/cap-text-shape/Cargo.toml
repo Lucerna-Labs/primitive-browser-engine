@@ -1,0 +1,16 @@
+[package]
+name = "cap-text-shape"
+version = "0.1.0"
+edition = "2021"
+description = "Renderer-neutral text shaping. Wraps cosmic-text to produce glyph runs (font id + glyph id + position) without binding to a specific renderer."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# cosmic-text — the same version Zed's gpui_wgpu uses, so the
+# shaping behaviour stays consistent if/when this crate adopts more
+# of the deconstruction map's text patterns.
+cosmic-text = "0.17"
+# Renderer-neutral pixel/length types. Lets the API speak Pixels
+# rather than raw f32, matching cap-geometry's vocabulary.
+cap-geometry = { path = "../cap-geometry" }

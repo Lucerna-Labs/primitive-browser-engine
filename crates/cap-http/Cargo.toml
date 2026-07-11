@@ -1,0 +1,10 @@
+[package]
+name = "cap-http"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP client type contracts for making HTTP requests with typed headers and responses"
+license = "MIT"
+
+[dependencies]
+smallvec = { workspace = true }
+thiserror = { workspace = true }

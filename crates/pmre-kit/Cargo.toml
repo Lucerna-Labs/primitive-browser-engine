@@ -1,0 +1,13 @@
+[package]
+name = "pmre-kit"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "The single primitive kit: all dumb rendering mechanism, wired from the 8 root atoms."
+
+[dependencies]
+pmre-core = { path = "../pmre-core" }
+pmre-raster = { path = "../pmre-raster" }
+pmre-text = { path = "../pmre-text" }
+pmre-layout = { path = "../pmre-layout" }
+pmre-html = { path = "../pmre-html" }

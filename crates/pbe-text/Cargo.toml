@@ -1,0 +1,11 @@
+[package]
+name = "pbe-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Text measurement + wrapping driven by the sealed cosmic-text shaper. The single composition point for real text metrics — layout and render both consume it so line breaks always agree."
+
+[dependencies]
+cap-geometry = { workspace = true }
+cap-text-shape = { workspace = true }

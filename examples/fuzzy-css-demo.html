@@ -1,0 +1,22 @@
+<html>
+  <body>
+    <style>
+      /* Real classes/ids/tags in this document: */
+      .recipes  { color: #b03030; }
+      #navigation { background-color: #e8e8ff; }
+
+      /* Deliberate typos — fuzzy lint should point them out: */
+      .recipies { color: red; }         /* typo of .recipes */
+      #navigaton { border: 1px solid; } /* typo of #navigation */
+      stron { font-weight: 900; }        /* typo of `strong` */
+      .absolutely-not-a-class { color: purple; } /* unrelated — no suggestion */
+    </style>
+
+    <nav id="navigation">
+      <strong>The Painted Fence</strong>
+    </nav>
+    <div class="recipes">
+      Real content the sheet was supposed to style.
+    </div>
+  </body>
+</html>

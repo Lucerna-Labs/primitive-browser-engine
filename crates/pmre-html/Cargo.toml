@@ -1,0 +1,11 @@
+[package]
+name = "pmre-html"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded HTML and CSS front end for PMRE."
+
+[dependencies]
+pmre-core = { path = "../pmre-core" }
+pmre-raster = { path = "../pmre-raster" }
+pmre-layout = { path = "../pmre-layout" }

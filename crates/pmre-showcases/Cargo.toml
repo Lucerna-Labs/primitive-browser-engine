@@ -1,0 +1,11 @@
+[package]
+name = "pmre-showcases"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Runnable PMRE examples kept outside the orchestrator crate line budget."
+
+[dependencies]
+pmre-kit = { path = "../pmre-kit" }
+pmre-orchestrator = { path = "../pmre-orchestrator" }

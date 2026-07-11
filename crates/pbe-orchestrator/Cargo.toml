@@ -11,8 +11,6 @@ name = "pbe"
 path = "src/main.rs"
 
 [dependencies]
-spiderweb = { workspace = true }
-spider = { workspace = true }
-pbe-protocol = { workspace = true }
-pbe-stages = { workspace = true }
-cap-primitives = { workspace = true }
+pbe-net = { workspace = true }
+pmre-kit = { workspace = true }
+pmre-orchestrator = { workspace = true }

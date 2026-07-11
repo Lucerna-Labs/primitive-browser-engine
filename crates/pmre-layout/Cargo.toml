@@ -1,0 +1,11 @@
+[package]
+name = "pmre-layout"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "UX tree and layout solver for PMRE."
+
+[dependencies]
+pmre-core = { path = "../pmre-core" }
+pmre-raster = { path = "../pmre-raster" }
+pmre-text = { path = "../pmre-text" }

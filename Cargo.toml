@@ -1,27 +1,59 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pbe-protocol",
+    "crates/cap-http",
+    "crates/cap-geometry",
+    "crates/cap-text-shape",
     "crates/pbe-net",
-    "crates/pbe-layout",
-    "crates/pbe-render",
-    "crates/pbe-stages",
+    "crates/pbe-text",
     "crates/pbe-orchestrator",
     "crates/pbe-shell",
+    "crates/pmre-core",
+    "crates/pmre-raster",
+    "crates/pmre-text",
+    "crates/pmre-layout",
+    "crates/pmre-html",
+    "crates/pmre-kit",
+    "crates/pmre-orchestrator",
+    "crates/pmre-showcases",
 ]
 
 # ---------------------------------------------------------------------------
-# Primitive Browser Engine — an orchestrator that composes an existing,
-# dumb math/render primitive kit over the Spiderweb bus.
+# Primitive Browser Engine — a thin caller around a complete rendering kit.
 #
 # Doctrine (composition, not cracking):
-#   - The primitive kit (F:\browser primitves + the cap-* store crates) holds
-#     ALL mechanism. We never modify it; we drive it from outside.
-#   - The Spiderweb bus (D:\Spiderweb-Bus-Next) is the fabric the stages talk
-#     over. We never modify it either.
-#   - THIS workspace is the orchestrator: all policy, no mechanism. Each render
-#     stage is a Strand wrapping a dumb primitive function; a page render is a
-#     thread that emerges as typed messages flow through the fabric.
+#   - pmre-kit + pmre-orchestrator (vendored from the sibling
+#     primitive-math-rendering-engine project) IS the renderer: math
+#     primitives (the eight root atoms — scan/hash/fold/project/scale/
+#     compare/combine/order) compose up into function primitives (box model,
+#     flex layout, SDF/scanline paint, real TrueType text), and that
+#     composition is already complete — `render_html` does parse + layout +
+#     paint + raster in one call. It is not a disassembled kit of separate
+#     steps needing an orchestrator wired around it; it is already the whole
+#     thing. We never modify it in place here; changes land upstream (in
+#     primitive-math-rendering-engine) and get re-copied.
+#   - pbe-net (driving the sealed system `curl`) is the network on-ramp
+#     primitive we compose over — also a complete, direct `url ->
+#     Result<FetchedPage>` call, not a stage in a pipeline.
+#   - THIS workspace is a thin caller: load a page, hand it to `render_html`,
+#     present or persist the result. There is nothing here to orchestrate.
+#
+# History (2026-07-03): this workspace originally drove the F:\ cap-* kit
+# (cap-html-parse/cap-css-parse/cap-style-cascade/cap-paint) via pbe-layout/
+# pbe-render/pbe-svg/pbe-fuzzy, wired as strands over the Spiderweb bus
+# (F:\Spiderweb-Bus-Next) — genuine orchestration, because that kit really
+# was a disassembled set of separate steps (parse, cascade, paint, raster)
+# that needed gluing together. That pipeline was retired in favor of
+# vendoring primitive-math-rendering-engine (PMRE) directly.
+#
+# A second pass the same day corrected an over-carried-over mistake: the bus/
+# strand/message-type ceremony (pbe-protocol, pbe-stages, the spider
+# supervisor) was kept even after the switch to PMRE, wrapping an
+# already-complete renderer in orchestration machinery built for gluing
+# together disassembled parts it no longer had to glue. pbe-protocol and
+# pbe-stages were deleted; pbe-orchestrator and pbe-shell now call
+# `pbe_net::fetch` and `pmre_orchestrator::render_html`/`render_uxi` directly,
+# synchronously, no bus in between. See ROADMAP.md.
 # ---------------------------------------------------------------------------
 
 [workspace.package]
@@ -31,26 +63,19 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.91"
 
 [workspace.dependencies]
-# --- The bus (drive from outside, never modified) ---
-spiderweb = { path = "D:/Spiderweb-Bus-Next/crates/spiderweb" }
-spider = { path = "D:/Spiderweb-Bus-Next/crates/spider" }
+# --- The network on-ramp's type contract (drive the sealed system curl) ---
+cap-http = { path = "crates/cap-http" }
 
-# --- The render primitive kit (drive from outside, never modified) ---
-cap-html-parse = { path = "F:/browser primitves/crates/cap-html-parse" }
-cap-css-parse = { path = "F:/browser primitves/crates/cap-css-parse" }
-cap-style-cascade = { path = "F:/browser primitves/crates/cap-style-cascade" }
-cap-paint = { path = "F:/browser primitves/crates/cap-paint" }
-cap-primitives = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-primitives" }
-cap-color = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-color" }
+# --- Still used by pbe-text (kept — orphaned by the pipeline retirement, not
+#     explicitly approved for removal, still builds/tests standalone) ---
+cap-geometry = { path = "crates/cap-geometry" }
+cap-text-shape = { path = "crates/cap-text-shape" }
 
-cap-geometry = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-geometry" }
-cap-layout = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-layout" }
-cap-text-shape = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-text-shape" }
-cap-http = { path = "F:/OPENCLAW-PROJECTS/Rust-crate-store-premitives/Rendering primitive create for ordo/crates/cap-http" }
+# Dependencies used only by the small vendored capability contracts above.
+smallvec = { version = "1.6", features = ["union"] }
+thiserror = "2.0"
 
 # --- Internal ---
-pbe-protocol = { path = "crates/pbe-protocol" }
 pbe-net = { path = "crates/pbe-net" }
-pbe-layout = { path = "crates/pbe-layout" }
-pbe-render = { path = "crates/pbe-render" }
-pbe-stages = { path = "crates/pbe-stages" }
+pmre-kit = { path = "crates/pmre-kit" }
+pmre-orchestrator = { path = "crates/pmre-orchestrator" }

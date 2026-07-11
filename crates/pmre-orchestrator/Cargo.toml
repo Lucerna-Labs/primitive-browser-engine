@@ -1,0 +1,14 @@
+[package]
+name = "pmre-orchestrator"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "The single orchestrator: all policy, no mechanism. Drives the kit."
+
+[dependencies]
+pmre-kit = { path = "../pmre-kit" }
+wgpu     = "22"
+pollster = "0.3"
+
+# Runnable demonstrations moved to the sibling `pmre-showcases` crate so the
+# policy orchestrator remains focused and under the global crate line ceiling.

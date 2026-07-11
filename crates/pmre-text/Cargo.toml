@@ -1,0 +1,9 @@
+[package]
+name = "pmre-text"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Font discovery and text raster primitives for PMRE."
+
+[dependencies]
+pmre-core = { path = "../pmre-core" }

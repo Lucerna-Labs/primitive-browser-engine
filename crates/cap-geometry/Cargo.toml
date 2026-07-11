@@ -1,0 +1,15 @@
+[package]
+name = "cap-geometry"
+version = "0.1.0"
+edition = "2024"
+description = "Renderer-neutral 2D geometry primitives — Point, Size, Bounds, Pixels, and spatial operations. Extracted from Zed's GPUI architecture."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[dependencies]
+
+[features]
+default = []
+
+[lints.clippy]
+dbg_macro = "deny"
