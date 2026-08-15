@@ -27,8 +27,36 @@ use crate::css::{self, Rule};
 use pmre_core::paint::Rgba;
 use pmre_layout::ux::{Align, Dim, Dir, Edges, Justify, Shadow, Span, Style, UxNode};
 use pmre_raster::raster::Image;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Numeric widget ids allocated to HTML form controls (`<input>`, `<button>`,
+/// `<textarea>`, `<select>`) so the orchestrator's `UiState` can track them
+/// interactively. Starts at `FORM_BASE` — well above the browser chrome's
+/// reserved range (1–99 in `pbe-shell`) so a page's controls never collide
+/// with the address bar / nav buttons.
+const FORM_BASE: u32 = 1000;
+
+/// Per-parse monotonic id allocator for form controls. Cheap `Cell<u32>`;
+/// one counter per `parse_with_images` call, so ids are stable within a
+/// single render but don't leak across pages.
+struct IdAlloc {
+    next: Cell<u32>,
+}
+
+impl IdAlloc {
+    fn new() -> Self {
+        IdAlloc {
+            next: Cell::new(FORM_BASE),
+        }
+    }
+    fn alloc(&self) -> u32 {
+        let id = self.next.get();
+        self.next.set(id + 1);
+        id
+    }
+}
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
 
@@ -59,11 +87,15 @@ enum Dom {
         /// `<img>`-specific attrs (src/alt/width/height). `None` on every
         /// other element.
         img_attrs: Option<ImgAttrs>,
+        /// The `type="..."` attribute for `<input>`/`<button>` (text,
+        /// checkbox, submit, ...). `None` on every other element.
+        form_type: Option<String>,
         kids: Vec<Dom>,
     },
     Text(String),
 }
 
+#[allow(clippy::large_enum_variant)] // Open carries the full attr set; Tok is transient
 enum Tok {
     Open {
         tag: String,
@@ -72,6 +104,7 @@ enum Tok {
         classes: Vec<String>,
         id_attr: Option<String>,
         img_attrs: Option<ImgAttrs>,
+        form_type: Option<String>,
         self_close: bool,
     },
     Close(String),
@@ -180,6 +213,7 @@ pub fn parse_with_images(src: &str, images: &HashMap<String, Arc<Image>>) -> UxN
     collect_style_text(&roots, &mut style_text);
     let sheet = css::parse_stylesheet(&style_text);
     let mut ancestors: Vec<AncestorStackFrame> = Vec::new();
+    let ids = IdAlloc::new();
     let kids = children_to_ux(
         &roots,
         Inherited::default(),
@@ -189,6 +223,7 @@ pub fn parse_with_images(src: &str, images: &HashMap<String, Arc<Image>>) -> UxN
         images,
         ParentList::None,
         &mut ancestors,
+        &ids,
     );
     if kids.len() == 1 {
         kids.into_iter().next().unwrap()
@@ -233,10 +268,7 @@ fn is_inline(tag: &str) -> bool {
 }
 
 fn is_dropped(tag: &str) -> bool {
-    matches!(
-        tag,
-        "img" | "input" | "meta" | "link" | "head" | "title" | "style"
-    )
+    matches!(tag, "img" | "meta" | "link" | "head" | "title" | "style")
 }
 
 // ─── Tokenizer ───────────────────────────────────────────────────────────────
@@ -363,7 +395,8 @@ fn tokenize(src: &str) -> Vec<Tok> {
             } else {
                 let self_close = inner.ends_with('/');
                 let inner = inner.trim_end_matches('/').trim();
-                let (tag, style_attr, href_attr, classes, id_attr, img_attrs) = parse_open(inner);
+                let (tag, style_attr, href_attr, classes, id_attr, img_attrs, form_type) =
+                    parse_open(inner);
                 // Raw-content element: skip everything until the matching
                 // close tag, scanning in place (no copy/lowercase of the
                 // whole remainder). Only <script> — its JS isn't executed,
@@ -394,6 +427,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
                     classes,
                     id_attr,
                     img_attrs,
+                    form_type,
                     self_close,
                 });
             }
@@ -435,6 +469,7 @@ fn parse_open(
     Vec<String>,
     Option<String>,
     Option<ImgAttrs>,
+    Option<String>,
 ) {
     let mut it = inner.splitn(2, char::is_whitespace);
     let tag = it.next().unwrap_or("").to_ascii_lowercase();
@@ -458,6 +493,11 @@ fn parse_open(
     } else {
         None
     };
+    let form_type = if tag == "input" || tag == "button" {
+        find_attr(attrs, "type")
+    } else {
+        None
+    };
     (
         tag,
         find_attr(attrs, "style"),
@@ -465,6 +505,7 @@ fn parse_open(
         classes,
         id_attr,
         img_attrs,
+        form_type,
     )
 }
 
@@ -544,6 +585,7 @@ fn parse_nodes(toks: &[Tok], pos: &mut usize, stop: Option<&str>, depth: usize) 
                 classes,
                 id_attr,
                 img_attrs,
+                form_type,
                 self_close,
             } => {
                 let tag = tag.clone();
@@ -552,6 +594,7 @@ fn parse_nodes(toks: &[Tok], pos: &mut usize, stop: Option<&str>, depth: usize) 
                 let classes = classes.clone();
                 let id_attr = id_attr.clone();
                 let img_attrs = img_attrs.clone();
+                let form_type = form_type.clone();
                 let self_close = *self_close || depth >= MAX_DOM_DEPTH;
                 *pos += 1;
                 let kids = if self_close {
@@ -566,6 +609,7 @@ fn parse_nodes(toks: &[Tok], pos: &mut usize, stop: Option<&str>, depth: usize) 
                     classes,
                     id_attr,
                     img_attrs,
+                    form_type,
                     kids,
                 });
             }
@@ -764,6 +808,7 @@ fn children_to_ux(
     images: &HashMap<String, Arc<Image>>,
     parent_list: ParentList,
     ancestors: &mut Vec<AncestorStackFrame>,
+    ids: &IdAlloc,
 ) -> Vec<UxNode> {
     let mut out: Vec<UxNode> = Vec::new();
     let mut run: Vec<Span> = Vec::new();
@@ -840,6 +885,7 @@ fn children_to_ux(
                 classes,
                 id_attr,
                 img_attrs,
+                form_type,
                 kids: inner,
                 ..
             } => {
@@ -866,12 +912,14 @@ fn children_to_ux(
                     classes,
                     style_attr.as_deref(),
                     img_attrs.as_ref(),
+                    form_type.as_deref(),
                     inner,
                     inh,
                     prefix,
                     sheet,
                     images,
                     ancestors,
+                    ids,
                 ) {
                     out.push(node);
                 }
@@ -984,12 +1032,14 @@ fn elem_to_ux(
     classes: &[String],
     style_attr: Option<&str>,
     img_attrs: Option<&ImgAttrs>,
+    form_type: Option<&str>,
     kids: &[Dom],
     inh: Inherited,
     li_prefix: Option<String>,
     sheet: &[Rule],
     images: &HashMap<String, Arc<Image>>,
     ancestors: &mut Vec<AncestorStackFrame>,
+    ids: &IdAlloc,
 ) -> Option<UxNode> {
     // <img>: emit a UxNode::Image if the src is in the pre-fetched map, drop
     // otherwise. This runs *before* `is_dropped(tag)` so an img with a hit
@@ -1014,6 +1064,54 @@ fn elem_to_ux(
             }
         }
     }
+    // <input>/<button>/<textarea>/<select>: interactive form controls. The
+    // kit's layout/paint already supports interactive roles (Style::input /
+    // Style::button, hit-tested by the orchestrator's UiState); the gap was
+    // only that the HTML reducer dropped these tags. Each gets a stable
+    // numeric widget id (allocated from `ids`, base 1000+) so the browser
+    // shell can track focus/value across renders. <form> itself is just a
+    // container Box (already handled by the generic path below).
+    if matches!(tag, "input" | "button" | "textarea" | "select") {
+        let wid = ids.alloc();
+        let mut style = tag_default_style(tag);
+        let mut inh2 = inh;
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let _ = apply_cascade(
+            &mut style,
+            &mut inh2,
+            sheet,
+            ancestors,
+            tag,
+            id,
+            &class_refs,
+            style_attr,
+        );
+        let style = match tag {
+            "button" | "select" => style.button(wid),
+            _ => style.input(wid),
+        };
+        // A <button>/<select> with text children renders its label inline;
+        // an <input> is a void control with no children.
+        let children = if matches!(tag, "button" | "select") {
+            let child_ids = IdAlloc::new();
+            children_to_ux(
+                kids,
+                inh2,
+                None,
+                false,
+                sheet,
+                images,
+                ParentList::None,
+                ancestors,
+                &child_ids,
+            )
+        } else {
+            Vec::new()
+        };
+        let _ = form_type; // captured for future type-specific styling
+        return Some(UxNode::Box { style, children });
+    }
+
     if is_dropped(tag) {
         return None;
     }
@@ -1058,6 +1156,7 @@ fn elem_to_ux(
         images,
         this_list,
         ancestors,
+        ids,
     );
     ancestors.pop();
     Some(UxNode::Box { style, children })
@@ -2080,5 +2179,68 @@ mod tests {
             }
         }
         assert!(!has_image(&root));
+    }
+
+    #[test]
+    fn input_control_renders_as_interactive_box_not_dropped() {
+        let root = parse(r#"<form><input type="text"></form>"#);
+        // The <input> must reach the render tree as an interactive Box
+        // (not be dropped as it was before form-control support).
+        fn has_input(node: &UxNode) -> bool {
+            if let UxNode::Box { style, children } = node {
+                style.role == pmre_layout::ux::Role::Input || children.iter().any(has_input)
+            } else {
+                false
+            }
+        }
+        assert!(has_input(&root), "expected an <input> to render");
+    }
+
+    #[test]
+    fn button_control_renders_with_label_text() {
+        let root = parse(r#"<button>Click me</button>"#);
+        fn has_button_with_text(node: &UxNode) -> bool {
+            if let UxNode::Box { style, children } = node {
+                (style.role == pmre_layout::ux::Role::Button
+                    && children
+                        .iter()
+                        .any(|c| matches!(c, UxNode::Rich { .. } | UxNode::Text { .. })))
+                    || children.iter().any(has_button_with_text)
+            } else {
+                false
+            }
+        }
+        assert!(
+            has_button_with_text(&root),
+            "expected a <button> with its label text"
+        );
+    }
+
+    #[test]
+    fn multiple_inputs_get_distinct_widget_ids() {
+        // Two <input> controls in the same parse must each get a unique
+        // numeric widget id so the orchestrator's UiState tracks them
+        // independently (no id collision with the chrome's 1-99 range).
+        let root = parse(r#"<div><input><input></div>"#);
+        let mut ids = Vec::new();
+        fn collect_input_ids(node: &UxNode, ids: &mut Vec<u32>) {
+            if let UxNode::Box { style, children } = node {
+                if style.role == pmre_layout::ux::Role::Input {
+                    if let Some(id) = style.id {
+                        ids.push(id);
+                    }
+                }
+                for c in children {
+                    collect_input_ids(c, ids);
+                }
+            }
+        }
+        collect_input_ids(&root, &mut ids);
+        assert_eq!(ids.len(), 2, "expected two inputs");
+        assert_ne!(ids[0], ids[1], "inputs must have distinct ids");
+        assert!(
+            ids.iter().all(|&i| i >= 1000),
+            "ids must be >= 1000 (FORM_BASE)"
+        );
     }
 }
