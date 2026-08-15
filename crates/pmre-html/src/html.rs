@@ -1880,29 +1880,27 @@ mod tests {
     }
 
     #[test]
-    fn child_combinator_still_dropped() {
-        // `>` isn't supported — the rule matches nothing.
-        let doc =
-            r#"<style>div > p { width: 999px; } p { height: 5px; }</style><div><p></p></div>"#;
+    fn child_combinator_matches_direct_child_only() {
+        // `>` (child combinator) is now supported: the rule applies to a
+        // `<p>` that is a *direct* child of a `<div>`, but not to a `<p>`
+        // nested deeper (a grandchild). Count the <p> nodes that picked up
+        // the 999px width — exactly one (the direct child).
+        let doc = r#"<style>div > p { width: 999px; }</style>
+            <div><p></p><section><p></p></section></div>"#;
         let root = parse(doc);
-        fn find_p_width(node: &UxNode) -> Option<f32> {
+        fn count_p_with_width(node: &UxNode, want: f32) -> usize {
             if let UxNode::Box { style, children } = node {
-                if let Dim::Px(w) = style.width {
-                    if (w - 999.0).abs() < 0.01 {
-                        return Some(w);
-                    }
-                }
-                for c in children {
-                    if let Some(w) = find_p_width(c) {
-                        return Some(w);
-                    }
-                }
+                let self_match = matches!(style.width, Dim::Px(w) if (w - want).abs() < 0.01);
+                let kids: usize = children.iter().map(|c| count_p_with_width(c, want)).sum();
+                (if self_match { 1 } else { 0 }) + kids
+            } else {
+                0
             }
-            None
         }
-        assert!(
-            find_p_width(&root).is_none(),
-            "child combinator `>` must not silently degrade to descendant"
+        assert_eq!(
+            count_p_with_width(&root, 999.0),
+            1,
+            "child combinator should match exactly the direct-child <p>"
         );
     }
 

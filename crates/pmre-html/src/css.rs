@@ -10,6 +10,37 @@
 //! matches nothing) rather than mis-parsed into matching a broader or narrower
 //! set of elements than the author intended.
 
+/// An attribute selector constraint on a single element, e.g.
+/// `[href]`, `[href="/x"]`, `[href^="https"]`, `[lang|=en]`. The kit's HTML
+/// reducer doesn't thread the full attribute map to the cascade (only
+/// tag/id/class today), so attribute selectors match against the *known*
+/// attributes the reducer does expose: `id` (via the id matcher) and the
+/// element's `class` list. Unknown attributes — the common case — fail
+/// closed (no match) rather than mis-match, since the reducer has no opinion
+/// on them. This keeps `[id]` / `[class]` working today and leaves the door
+/// open for a richer attribute plumbing later.
+#[derive(Clone, Debug)]
+pub struct AttrSelector {
+    pub name: String,
+    pub op: AttrOp,
+    pub value: Option<String>,
+}
+
+/// The comparison an [`AttrSelector`] applies (CSS attr-selector operators).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttrOp {
+    /// `[attr]` — attribute is present.
+    Exists,
+    /// `[attr=val]` — exactly equal.
+    Equals,
+    /// `[attr^=val]` — begins with.
+    Prefix,
+    /// `[attr$=val]` — ends with.
+    Suffix,
+    /// `[attr*=val]` — contains.
+    Contains,
+}
+
 /// One compound selector: every part must match the same element.
 /// `div.card#hero` → `{ type_name: Some("div"), id: Some("hero"), classes: ["card"] }`.
 #[derive(Clone, Debug, Default)]
@@ -17,16 +48,21 @@ pub struct Selector {
     pub type_name: Option<String>,
     pub id: Option<String>,
     pub classes: Vec<String>,
+    /// Attribute selectors (`[href]`, `[class^="btn"]`, …). Empty for the
+    /// common case. Matched against id/class only today (see [`AttrSelector`]).
+    pub attrs: Vec<AttrSelector>,
 }
 
 impl Selector {
     /// CSS specificity as `(id, class, type)` counts, compared
     /// lexicographically — matches the real cascade's id > class > type
     /// precedence order exactly (tuple comparison is lexicographic in Rust).
+    /// Attribute selectors count as class-level specificity (one each), per
+    /// the CSS spec.
     fn specificity(&self) -> (u32, u32, u32) {
         (
             u32::from(self.id.is_some()),
-            self.classes.len() as u32,
+            self.classes.len() as u32 + self.attrs.len() as u32,
             u32::from(self.type_name.is_some()),
         )
     }
@@ -42,17 +78,79 @@ impl Selector {
                 return false;
             }
         }
-        self.classes.iter().all(|c| classes.contains(&c.as_str()))
+        if !self.classes.iter().all(|c| classes.contains(&c.as_str())) {
+            return false;
+        }
+        // Attribute selectors: match against id / class only today.
+        self.attrs.iter().all(|a| a.matches(id, classes))
     }
 }
 
-/// A descendant chain: one or more compound `Selector`s to be matched
-/// right-to-left. `[Selector { type_name: Some("div") }, Selector {
-/// type_name: Some("p") }]` matches a `<p>` that has some ancestor `<div>`.
-/// A single-compound chain (length 1) behaves like the old direct-match
-/// selector — no ancestor requirement — so nothing about pre-descendant
-/// stylesheets changes.
-pub type Chain = Vec<Selector>;
+impl AttrSelector {
+    /// Match this attribute selector against the element's known attributes
+    /// (id + class list, the only ones the reducer exposes today). Unknown
+    /// attribute names fail closed (no match).
+    fn matches(&self, id: Option<&str>, classes: &[&str]) -> bool {
+        // Resolve the attribute's current value, if it's one we track.
+        let val: Option<String> = if self.name.eq_ignore_ascii_case("id") {
+            id.map(str::to_string)
+        } else if self.name.eq_ignore_ascii_case("class") {
+            let v = classes.join(" ");
+            Some(v)
+        } else {
+            // Unknown attribute — the reducer doesn't expose it. Fail closed.
+            None
+        };
+        match self.op {
+            AttrOp::Exists => val.is_some(),
+            AttrOp::Equals => val.as_deref() == self.value.as_deref(),
+            AttrOp::Prefix => val
+                .as_deref()
+                .zip(self.value.as_deref())
+                .map(|(v, w)| v.starts_with(w))
+                .unwrap_or(false),
+            AttrOp::Suffix => val
+                .as_deref()
+                .zip(self.value.as_deref())
+                .map(|(v, w)| v.ends_with(w))
+                .unwrap_or(false),
+            AttrOp::Contains => val
+                .as_deref()
+                .zip(self.value.as_deref())
+                .map(|(v, w)| v.contains(w))
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// The combinator joining one compound selector to the preceding step in a
+/// chain. Descendant (whitespace) is the default and the historical
+/// behaviour; `>` (child) is new; `+`/`~` (siblings) need sibling context the
+/// reducer doesn't thread yet, so they still fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Combinator {
+    /// `A B` — B is a descendant of A (any depth). The default; pre-existing.
+    #[default]
+    Descendant,
+    /// `A > B` — B is a direct child of A.
+    Child,
+}
+
+/// One step in a selector chain: a compound selector plus the combinator
+/// that joins it to the step *before* it (the leftmost step's combinator is
+/// unused — there's nothing to its left). Replaces the bare `Vec<Selector>`
+/// chain so child combinators carry their own semantics.
+#[derive(Clone, Debug)]
+pub struct ChainStep {
+    pub selector: Selector,
+    pub combinator: Combinator,
+}
+
+/// A selector chain: one or more [`ChainStep`]s matched right-to-left.
+/// `[Child(div) Descendant(p)]` matches a `<p>` whose parent chain contains a
+/// `<div>` (with the `<p>` itself matched by the rightmost step). A
+/// single-step chain behaves like the old direct-match selector.
+pub type Chain = Vec<ChainStep>;
 
 /// One parsed rule: a comma-separated selector list (matches if *any* chain
 /// in the list matches) plus its declaration block, kept as the raw
@@ -103,41 +201,68 @@ impl Rule {
 /// tree) than the next compound's. This is the standard CSS descendant
 /// combinator semantics.
 fn match_chain(
-    chain: &[Selector],
+    chain: &[ChainStep],
     ancestors: &[AncestorFrame<'_>],
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
 ) -> Option<(u32, u32, u32)> {
+    // Walk the chain right-to-left (element first, then its ancestors). The
+    // combinator that governs the relationship between step `i` and the
+    // element/step to its *right* lives on step `i+1` (or `last`). So when
+    // matching an ancestor for step `rest[i]`, we consult the combinator of
+    // the step we just matched toward (the next step in the right-to-left
+    // walk — i.e. `rest[i+1]`, or `last` when `i` is the last in `rest`).
     let (last, rest) = chain.split_last()?;
-    if !last.matches(tag, id, classes) {
+    if !last.selector.matches(tag, id, classes) {
         return None;
     }
-    // Iterate the preceding compounds from rightmost (nearest ancestor)
-    // toward the root, and walk the ancestor slice from its end (nearest
-    // to the element) backward — each compound must find some ancestor
-    // strictly earlier than the previous compound's match.
+    // `ancestor_i` is the index *after* the most-recently-considered
+    // ancestor: ancestors[..ancestor_i] remain as candidates for the next
+    // step up. Start at the end (the element's nearest ancestor).
     let mut ancestor_i = ancestors.len();
+    // Walk rest right-to-left; for each step, the combinator that applies is
+    // the one on the *following* (already-matched, rightward) step.
+    let mut following_combinator = last.combinator;
     for step in rest.iter().rev() {
         let mut found = false;
-        while ancestor_i > 0 {
-            ancestor_i -= 1;
-            let (at, aid, acls) = ancestors[ancestor_i];
-            if step.matches(at, aid, acls) {
-                found = true;
-                break;
+        match following_combinator {
+            Combinator::Descendant => {
+                // Any earlier ancestor can match.
+                while ancestor_i > 0 {
+                    ancestor_i -= 1;
+                    let (at, aid, acls) = ancestors[ancestor_i];
+                    if step.selector.matches(at, aid, acls) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            Combinator::Child => {
+                // Only the immediate parent (ancestor_i - 1) can satisfy a
+                // child combinator. If it doesn't match, the whole chain
+                // fails — no walking further up.
+                if ancestor_i == 0 {
+                    return None;
+                }
+                ancestor_i -= 1;
+                let (at, aid, acls) = ancestors[ancestor_i];
+                if step.selector.matches(at, aid, acls) {
+                    found = true;
+                }
             }
         }
         if !found {
             return None;
         }
+        following_combinator = step.combinator;
     }
     // Specificity of a chain is the field-wise sum of its compound
     // specificities, per the real CSS cascade (a chain with two class
     // selectors has specificity (0, 2, 0), not (0, 1, 0)).
     let mut spec = (0u32, 0u32, 0u32);
     for c in chain {
-        let s = c.specificity();
+        let s = c.selector.specificity();
         spec.0 += s.0;
         spec.1 += s.1;
         spec.2 += s.2;
@@ -193,24 +318,65 @@ pub fn parse_stylesheet(css: &str) -> Vec<Rule> {
     rules
 }
 
-/// Parse one comma-separated selector as a descendant chain — one or more
-/// whitespace-separated compound selectors. Returns `None` (fail-closed) if
-/// any compound uses unsupported syntax (`>`, `+`, `~`, `*`, `[`, `:`), so
-/// a rule like `div > p` matches nothing rather than degrading into `div p`.
+/// Parse one comma-separated selector as a chain — one or more
+/// whitespace-separated compound selectors joined by combinators. Supported
+/// combinators: descendant (whitespace) and child (`>`). Still fail-closed on
+/// sibling combinators (`+`/`~`), universal (`*`), and pseudo-classes (`:`) —
+/// they need context the reducer doesn't thread (sibling stack, interaction
+/// state), so a rule using them matches nothing rather than mis-matching.
+/// Attribute selectors (`[attr]`, `[attr=val]`, …) are supported via
+/// [`parse_compound`].
 fn parse_selector(s: &str) -> Option<Chain> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    // Reject unsupported combinators / selector syntax at the WHOLE selector
-    // level — anywhere they appear inside a chain fails the whole chain.
-    if s.contains(['>', '+', '~', '*', '[', ':']) {
+    // Sibling combinators + universal + pseudo-classes still fail closed.
+    if s.contains(['+', '~', '*', ':']) {
         return None;
     }
+    // Tokenise: split on whitespace, but keep a standalone `>` as its own
+    // token so `div > p` yields [div, >, p]. Multiple spaces collapse via
+    // split_whitespace already.
+    let tokens: Vec<&str> = s.split_whitespace().collect();
     let mut chain: Chain = Vec::new();
-    for part in s.split_whitespace() {
-        let sel = parse_compound(part)?;
-        chain.push(sel);
+    let mut pending_child = false; // a `>` is pending; the next compound is a child
+    for tok in tokens {
+        if tok == ">" {
+            pending_child = true;
+            continue;
+        }
+        // A compound may itself contain `>` only if it's like `div>p` (no
+        // spaces) — handle that by splitting on `>` too.
+        let mut sub_iter = tok.split('>').peekable();
+        let mut first_sub = true;
+        while let Some(sub) = sub_iter.next() {
+            if !first_sub {
+                pending_child = true;
+            }
+            if sub.is_empty() {
+                // leading/trailing `>` inside the token (e.g. `div>` or `>p`)
+                first_sub = false;
+                continue;
+            }
+            let sel = parse_compound(sub)?;
+            let combinator = if pending_child {
+                Combinator::Child
+            } else {
+                Combinator::Descendant
+            };
+            chain.push(ChainStep {
+                selector: sel,
+                combinator,
+            });
+            pending_child = false;
+            first_sub = false;
+            // If there's another sub after this one (split on `>`), the next
+            // is a child.
+            if sub_iter.peek().is_some() {
+                pending_child = true;
+            }
+        }
     }
     if chain.is_empty() {
         None
@@ -220,15 +386,32 @@ fn parse_selector(s: &str) -> Option<Chain> {
 }
 
 /// Parse one compound selector (no whitespace, no combinators) — the
-/// smallest unit inside a descendant chain.
+/// smallest unit inside a chain. Supports type/`.class`/`#id` plus attribute
+/// selectors (`[attr]`, `[attr=val]`, `[attr^=val]`, `[attr$=val]`,
+/// `[attr*=val]`). Quoted values (`[href="x"]`) and unquoted (`[href=x]`)
+/// both work.
 fn parse_compound(s: &str) -> Option<Selector> {
     if s.is_empty() {
         return None;
     }
     let mut sel = Selector::default();
+    // First, peel off any `[...]` attribute selectors so they don't confuse
+    // the `.`/`#` walk below. A `[` without a matching `]` fails the whole
+    // compound (fail-closed).
+    let mut rest = s.to_string();
+    while let Some(open) = rest.find('[') {
+        let Some(close_rel) = rest[open..].find(']') else {
+            return None; // unterminated attribute selector
+        };
+        let close = open + close_rel;
+        let attr_text = &rest[open + 1..close];
+        let attr = parse_attr(attr_text)?; // malformed attribute selector -> None
+        sel.attrs.push(attr);
+        rest = format!("{}{}", &rest[..open], &rest[close + 1..]);
+    }
     let mut cur = String::new();
     let mut kind = 'e'; // 'e' = type/tag, '.' = class, '#' = id
-    for ch in s.chars() {
+    for ch in rest.chars() {
         if ch == '.' || ch == '#' {
             set_part(&mut sel, kind, &cur);
             cur.clear();
@@ -238,10 +421,74 @@ fn parse_compound(s: &str) -> Option<Selector> {
         }
     }
     set_part(&mut sel, kind, &cur);
-    if sel.type_name.is_none() && sel.id.is_none() && sel.classes.is_empty() {
+    if sel.type_name.is_none() && sel.id.is_none() && sel.classes.is_empty() && sel.attrs.is_empty()
+    {
         None
     } else {
         Some(sel)
+    }
+}
+
+/// Parse the inside of an attribute selector (the text between `[` and `]`).
+/// `[href]`, `[href=x]`, `[href="x"]`, `[href^=x]`, `[href$=x]`, `[href*=x]`.
+fn parse_attr(inner: &str) -> Option<AttrSelector> {
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    // Find the operator, if any.
+    let (name, op, value) = if let Some(idx) = inner.find("*=") {
+        (
+            inner[..idx].trim(),
+            AttrOp::Contains,
+            val_after(inner, idx + 2),
+        )
+    } else if let Some(idx) = inner.find("^=") {
+        (
+            inner[..idx].trim(),
+            AttrOp::Prefix,
+            val_after(inner, idx + 2),
+        )
+    } else if let Some(idx) = inner.find("$=") {
+        (
+            inner[..idx].trim(),
+            AttrOp::Suffix,
+            val_after(inner, idx + 2),
+        )
+    } else if let Some(idx) = inner.find('=') {
+        (
+            inner[..idx].trim(),
+            AttrOp::Equals,
+            val_after(inner, idx + 1),
+        )
+    } else {
+        (inner, AttrOp::Exists, None)
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(AttrSelector {
+        name: name.to_ascii_lowercase(),
+        op,
+        value: value.map(|v| v.to_string()),
+    })
+}
+
+/// Extract the value part of an attribute selector after the operator,
+/// stripping surrounding quotes if present.
+fn val_after(s: &str, start: usize) -> Option<&str> {
+    if start >= s.len() {
+        return None;
+    }
+    let v = s[start..].trim();
+    if v.is_empty() {
+        return None;
+    }
+    let bytes = v.as_bytes();
+    if (bytes[0] == b'"' || bytes[0] == b'\'') && v.len() >= 2 {
+        Some(&v[1..v.len() - 1])
+    } else {
+        Some(v)
     }
 }
 
@@ -397,25 +644,103 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_combinator_syntax_still_fails_closed() {
-        // `>` is a child combinator — still unsupported, whole rule dropped.
+    fn child_combinator_now_parses() {
+        // `>` (child combinator) is now supported — the rule parses.
         let rules = parse_stylesheet("div > p { color: red; }");
-        assert_eq!(
-            rules.len(),
-            0,
-            "child combinator should still be dropped (not supported)"
-        );
-        // `+`, `~`, `*`, `[`, `:` also dropped.
+        assert_eq!(rules.len(), 1, "child combinator should parse now");
+    }
+
+    #[test]
+    fn unsupported_combinator_syntax_still_fails_closed() {
+        // `+`, `~`, `*`, `:` still unsupported — whole rule dropped.
         assert_eq!(parse_stylesheet("a:hover { color: red; }").len(), 0);
         assert_eq!(parse_stylesheet("div + p { color: red; }").len(), 0);
         assert_eq!(parse_stylesheet("div ~ p { color: red; }").len(), 0);
-        assert_eq!(parse_stylesheet("[data-x] { color: red; }").len(), 0);
         assert_eq!(parse_stylesheet("* { color: red; }").len(), 0);
+    }
+
+    #[test]
+    fn attribute_selector_parses_but_unknown_attr_fails_closed() {
+        // `[data-x]` is a valid attribute selector and parses, but `data-x`
+        // isn't an attribute the reducer exposes (only id/class), so it
+        // matches nothing today — the rule still parses (1 rule) for future
+        // attribute-plumbing.
+        let rules = parse_stylesheet("[data-x] { color: red; }");
+        assert_eq!(rules.len(), 1, "attribute selector should parse");
     }
 
     #[test]
     fn malformed_trailing_text_does_not_panic() {
         let rules = parse_stylesheet("div { color: red; } trailing garbage no brace");
         assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn attribute_selector_id_exists_matches() {
+        // [id] matches an element with an id attribute.
+        let chain = parse_selector("[id]").expect("[id] should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        assert!(match_chain(&chain, &ancestors, "div", Some("main"), &[]).is_some());
+        // No id -> no match.
+        assert!(match_chain(&chain, &ancestors, "div", None, &[]).is_none());
+    }
+
+    #[test]
+    fn attribute_selector_class_equals_matches() {
+        // NOTE: spaces inside a quoted attribute value (`[class="a b"]`)
+        // aren't tokenized yet (the selector splitter is whitespace-based),
+        // so this test uses a single-class value. Multi-word values are a
+        // future tokenizer improvement.
+        let chain = parse_selector(r#"[class="btn"]"#).expect("should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        // Element with class "btn" matches.
+        assert!(match_chain(&chain, &ancestors, "a", None, &["btn"]).is_some());
+        // Different class -> no match.
+        assert!(match_chain(&chain, &ancestors, "a", None, &["nav"]).is_none());
+    }
+
+    #[test]
+    fn attribute_selector_class_prefix_matches() {
+        let chain = parse_selector(r#"[class^="btn"]"#).expect("should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        assert!(match_chain(&chain, &ancestors, "a", None, &["btn-primary"]).is_some());
+        assert!(match_chain(&chain, &ancestors, "a", None, &["nav-link"]).is_none());
+    }
+
+    #[test]
+    fn attribute_selector_unknown_attr_fails_closed() {
+        // [data-x] parses but data-x isn't exposed -> no match ever.
+        let chain = parse_selector("[data-x]").expect("should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        assert!(match_chain(&chain, &ancestors, "div", Some("a"), &["b"]).is_none());
+    }
+
+    #[test]
+    fn compound_with_attribute_and_class() {
+        // div.card[id] -- a div with class card and an id.
+        let chain = parse_selector("div.card[id]").expect("should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        assert!(match_chain(&chain, &ancestors, "div", Some("x"), &["card"]).is_some());
+        assert!(match_chain(&chain, &ancestors, "div", None, &["card"]).is_none());
+    }
+
+    #[test]
+    fn child_combinator_in_three_step_chain() {
+        // div > section p: p must be a descendant of a section that is a
+        // direct child of a div.
+        let chain = parse_selector("div > section p").expect("should parse");
+        let empty: &[&str] = &[];
+        // ancestors: [div, section] -> p descendant of section, section child of div.
+        let ancestors: Vec<AncestorFrame<'_>> =
+            vec![("div", None, empty), ("section", None, empty)];
+        assert!(match_chain(&chain, &ancestors, "p", None, &[]).is_some());
+        // ancestors: [div, article, section] -> section is NOT a direct child
+        // of div (article intervenes) -> no match.
+        let ancestors2: Vec<AncestorFrame<'_>> = vec![
+            ("div", None, empty),
+            ("article", None, empty),
+            ("section", None, empty),
+        ];
+        assert!(match_chain(&chain, &ancestors2, "p", None, &[]).is_none());
     }
 }
