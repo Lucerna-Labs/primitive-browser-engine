@@ -1,5 +1,72 @@
 # Roadmap
 
+## Done (2026-07-16) — JS engine + image codecs + form controls + CSS combinators
+
+Four capability additions shipped as one batch, each closing a gap
+flagged in the "what else it needs" review. Each lands in its own
+swappable crate or behind the existing kit boundary, per the doctrine.
+
+### JavaScript (`pbe-js`, new crate)
+
+- Wraps boa (pure-Rust ECMAScript, no C build chain). `<script>` runs
+  during page load in `pbe-shell`; `console.log`/`console.error` → stderr,
+  `document.getTitle/setTitle` → page label, `fetch(url)` → the modular
+  `pbe-proto` protocol layer. Script errors are non-fatal (logged + the
+  page still loads), matching real-browser behaviour.
+- Why boa not V8: V8 links C++ and drags a foreign engine into our
+  address space; boa is pure-Rust, auditable — the same trade `ring`-
+  over-`aws-lc-rs` makes for TLS. boa 0.20's safe native-function API
+  requires `Copy` closures, so hooks are stashed in `thread_local!` slots
+  the closures read from (fine: the browser is single-threaded, like
+  `cap-text-shape`'s shaper). No `unsafe`.
+- 7 tests: arithmetic, function def+call, syntax/throw errors, console
+  routing, document.title round-trip, fetch via hook.
+
+### Image codecs (`pbe-img-codecs`, new crate)
+
+- JPEG + WebP + GIF decoders via the `image` crate, behind a swappable
+  boundary that decodes to the kit's `Image` type. The in-kit BMP/PNG
+  decoders stay zero-dep; `pbe-shell`'s `decode_image_bytes` dispatches
+  by magic bytes (BMP/PNG first, then this crate).
+- 8 tests including JPEG + WebP round-trips against synthesized images.
+
+### Form controls (kit: `pmre-html`)
+
+- `<input>`/`<button>`/`<textarea>`/`<select>` removed from `is_dropped`
+  and rendered as interactive widgets (`Style::input/.button`, hit-tested
+  by the orchestrator's `UiState`). A per-parse `IdAlloc` (base 1000+)
+  gives each control a stable numeric widget id that never collides with
+  the browser chrome's 1–99. `parse_open` + `Dom::Elem`/`Tok::Open` gained
+  a `form_type` field (the `type=` attribute) plumbed through.
+- 3 tests: input renders (not dropped), button renders with label text,
+  multiple inputs get distinct ids >= 1000.
+
+### CSS child combinator + attribute selectors (kit: `pmre-html::css`)
+
+- Child combinator (`A > B`): `ChainStep` carries a `Combinator`
+  (Descendant | Child); `match_chain` walks right-to-left using the
+  *following* step's combinator, so `div > p` matches a direct child but
+  not a deeper descendant.
+- Attribute selectors (`[attr]`, `[attr=val]`, `[attr^=val]`, `[attr$=val]`,
+  `[attr*=val]`): `AttrSelector` + `AttrOp` on `Selector`. Matched against
+  id/class (the only attrs the reducer exposes today); unknown attrs fail
+  closed. Spaces inside quoted values (`[class="a b"]`) aren't tokenized
+  yet (noted).
+- Sibling combinators (`+`/`~`), universal (`*`), pseudo-classes (`:`)
+  still fail closed — they need sibling-stack / interaction-state context
+  the reducer doesn't thread yet.
+- 7 new tests + 2 existing tests updated (they had asserted `>`/`[` were
+  dropped).
+
+### Verification
+
+- Full workspace green: **215 tests pass** (was 184), 0 failed.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --all --check` clean.
+- New crates: `pbe-js`, `pbe-img-codecs`. New deps: `boa_engine`,
+  `image` (jpeg/webp/gif features), `rustls`+`ring`+`webpki-roots`
+  (already added with the WebSocket persistent connection).
+
 ## Done (2026-07-15, latest) — modular protocol layer (one crate per modern protocol)
 
 The network on-ramp was a single monolithic crate (`pbe-net`) that
