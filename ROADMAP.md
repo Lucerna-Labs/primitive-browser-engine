@@ -1,5 +1,82 @@
 # Roadmap
 
+## Done (2026-07-15, latest) — modular protocol layer (one crate per modern protocol)
+
+The network on-ramp was a single monolithic crate (`pbe-net`) that
+handled only `http`/`https` and rejected every other scheme. It now
+delegates to a **modular protocol layer**: one crate per modern fetch
+protocol, each independently swappable, debuggable, and upgradable —
+the composition doctrine applied to protocols as much as to rendering.
+No backward compatibility with old/legacy protocols, by design.
+
+### New crates
+
+- **`pbe-proto`** — the protocol **dispatch** layer: the single
+  composition point that routes a URL to its per-protocol crate. Owns the
+  shared `Resource` type (one return shape for every protocol) and the
+  `FetchError` enum (one error set for every protocol). Classifies a
+  URL's scheme and hands off; no mechanism of its own.
+- **`pbe-proto-http`** — `http`/`https`. Absorbs the existing
+  sealed-binary-driving logic (the `--write-out` metadata sentinel, the
+  byte-level `rfind`, the scheme allow-list, redirect/timeout args) that
+  lived in `pbe-net`. Zero linked HTTP/TLS deps — same security posture
+  as before, just in its own crate.
+- **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455). Splits the
+  protocol into its two concerns: the **handshake** (an HTTP `Upgrade`
+  request) drives the sealed system HTTP client with response headers
+  included, so no TLS/HTTP stack is linked; the **frame codec**
+  (`encode_frame`/`decode_frame`, opcode + masked payload, 7/16/64-bit
+  length) is pure Rust. The handshake + codec are complete and
+  unit-tested offline; a live persistent read/write loop is intentionally
+  not wired (it would need a socket primitive the engine does not yet
+  link — matching the doctrine: don't link what you don't need).
+- **`pbe-proto-data`** — `data:` URIs (RFC 2397). Pure byte work, zero
+  I/O, zero deps: split the media type from the data, base64-decode if
+  `;base64` is set, else percent-decode. Defaults to
+  `text/plain;charset=US-ASCII` per the RFC.
+
+### Rewired
+
+- **`pbe-net`** is now a thin **facade** over `pbe-proto`. It preserves
+  the original `fetch` / `fetch_bytes` / `FetchedPage` / `FetchedBytes`
+  API (with `From<Resource>` conversions) so `pbe-shell` and
+  `pbe-orchestrator` keep working unchanged, while transparently routing
+  `ws`/`wss`/`data:` through the new layer. New callers should prefer
+  the `pbe_proto` API directly (one `Resource` for every protocol).
+- **`pbe-shell`** `classify()` and the image/stylesheet fetch helpers now
+  recognize all modern schemes (`http(s)`/`ws(s)`/`data:`) as network
+  URLs, so the browser can navigate to (and resolve `<a href>`/`<img
+  src>`/`<link href>` against) any of them. `file:` access stays a
+  browser-layer concern (`std::fs`), never a network protocol.
+
+### Modern only, no legacy
+
+Only the protocols a modern browser fetches over are routed: `http`,
+`https`, `ws`, `wss`, `data`. Legacy schemes (`file://`, `ftp://`,
+`scp://`, …) are rejected by `pbe-proto` as `UnsupportedScheme` (with
+the scheme name in the error) rather than silently mis-handled. This is
+deliberate: the request was modern protocols only, no backward
+compatibility with old protocols.
+
+### Tests + verification
+
+- `pbe-proto`: 6 tests (scheme routing, unsupported-scheme rejection).
+- `pbe-proto-http`: 8 tests (scheme rejection, sentinel split,
+  non-UTF-8 byte preservation).
+- `pbe-proto-ws`: 13 tests (scheme rejection, key generation, frame
+  encode/decode round-trips, extended-length, masked-server rejection,
+  handshake-response parsing).
+- `pbe-proto-data`: 13 tests (text + base64 + binary, media-type
+  defaults/parameters, error cases).
+- `pbe-net`: 9 tests (legacy facade rejection preserved, `data:` routes
+  through, `Resource` conversions).
+- `pbe-shell`: 4 new scheme-classification + href-passthrough tests.
+- Full green sweep on the touched crates: `cargo test` (49 new tests,
+  all passing), `cargo clippy --all-targets -- -D warnings` clean,
+  `cargo fmt --check` clean.
+- The pre-existing `cap-text-shape` test failures (cosmic-text needs
+  system fonts unavailable in the sandbox) are unchanged and unrelated.
+
 ## Done (2026-07-04, latest) — `<blockquote>` semantic default + `<hr>` respects CSS
 
 Two small kit fixes shipped together. Both improved how real content pages

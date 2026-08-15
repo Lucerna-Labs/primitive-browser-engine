@@ -48,11 +48,26 @@ enum Origin {
 }
 
 fn classify(address: &str) -> Origin {
-    if address.starts_with("http://") || address.starts_with("https://") {
+    // The modern protocols the engine speaks: http(s), ws(s), and data:.
+    // Each is routed through pbe_net (which dispatches to the matching
+    // pbe-proto-* crate). Anything else is a local file path.
+    if is_network_scheme(address) {
         Origin::Url(address.to_string())
     } else {
         Origin::File(address.to_string())
     }
+}
+
+/// Whether `address` begins with one of the modern fetch protocols the
+/// modular protocol layer routes (http/https/ws/wss/data). Everything else
+/// is treated as a local file path.
+fn is_network_scheme(address: &str) -> bool {
+    let a = address.to_ascii_lowercase();
+    a.starts_with("http://")
+        || a.starts_with("https://")
+        || a.starts_with("ws://")
+        || a.starts_with("wss://")
+        || a.starts_with("data:")
 }
 
 fn load(origin: &Origin) -> (String, UxNode) {
@@ -123,7 +138,7 @@ fn fetch_page_images(base: &str, html: &str) -> HashMap<String, Arc<Image>> {
 /// gets its bytes replaced with U+FFFD" defect that the first cut of img
 /// support shipped with.
 fn fetch_image_bytes(target: &str) -> Option<Vec<u8>> {
-    if target.starts_with("http://") || target.starts_with("https://") {
+    if is_network_scheme(target) {
         pbe_net::fetch_bytes(target).ok().map(|p| p.body)
     } else {
         std::fs::read(target).ok()
@@ -196,7 +211,7 @@ fn inject_external_stylesheets(base: &str, html: &str) -> String {
 /// `pbe_net::fetch` for URLs, `std::fs` for local paths. Returns `None` on
 /// any failure — the caller treats missing sheets as no styling, not fatal.
 fn fetch_stylesheet_text(target: &str) -> Option<String> {
-    if target.starts_with("http://") || target.starts_with("https://") {
+    if is_network_scheme(target) {
         pbe_net::fetch(target).ok().map(|p| p.body)
     } else {
         std::fs::read_to_string(target).ok()
@@ -318,7 +333,9 @@ fn error_html(msg: &str) -> String {
 /// so this stays a plain string primitive rather than pulling one in for a
 /// handful of cases.
 fn resolve_href(base: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
+    // Absolute URLs of any modern protocol pass through untouched (http(s),
+    // ws(s), data:). Relative hrefs resolve against the base below.
+    if is_network_scheme(href) {
         return href.to_string();
     }
     if let Some(scheme_end) = base.find("://") {
@@ -882,7 +899,7 @@ mod stylesheet_scan_tests {
 
 #[cfg(test)]
 mod resolve_href_tests {
-    use super::resolve_href;
+    use super::{classify, resolve_href, Origin};
 
     #[test]
     fn absolute_href_passes_through() {
@@ -926,5 +943,37 @@ mod resolve_href_tests {
         let resolved = resolve_href(base, "about.html");
         assert!(resolved.ends_with("about.html"));
         assert!(resolved.contains("pages"));
+    }
+
+    #[test]
+    fn classify_treats_modern_schemes_as_urls() {
+        assert!(matches!(classify("https://example.com"), Origin::Url(_)));
+        assert!(matches!(classify("http://example.com"), Origin::Url(_)));
+        assert!(matches!(classify("ws://echo.example.com"), Origin::Url(_)));
+        assert!(matches!(classify("wss://echo.example.com"), Origin::Url(_)));
+        assert!(matches!(classify("data:,hello"), Origin::Url(_)));
+    }
+
+    #[test]
+    fn classify_treats_bare_paths_as_files() {
+        assert!(matches!(classify("page.html"), Origin::File(_)));
+        assert!(matches!(classify("/abs/path/page.html"), Origin::File(_)));
+    }
+
+    #[test]
+    fn classify_is_case_insensitive_on_scheme() {
+        assert!(matches!(classify("HTTPS://Example.COM"), Origin::Url(_)));
+        assert!(matches!(classify("WSS://echo.example.com"), Origin::Url(_)));
+        assert!(matches!(classify("DATA:,hi"), Origin::Url(_)));
+    }
+
+    #[test]
+    fn resolve_href_passes_through_ws_and_data_urls() {
+        assert_eq!(resolve_href("https://x/page", "ws://echo/x"), "ws://echo/x");
+        assert_eq!(
+            resolve_href("https://x/page", "wss://echo/x"),
+            "wss://echo/x"
+        );
+        assert_eq!(resolve_href("https://x/page", "data:,hello"), "data:,hello");
     }
 }

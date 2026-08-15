@@ -1,0 +1,10 @@
+[package]
+name = "pbe-proto-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WebSocket protocol crate (RFC 6455) — ws/wss handshake (driving the sealed system curl) + pure-Rust frame codec. No linked TLS/HTTP stack."
+
+[dependencies]
+cap-http = { workspace = true }

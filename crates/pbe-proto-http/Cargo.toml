@@ -1,0 +1,10 @@
+[package]
+name = "pbe-proto-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP/HTTPS protocol crate — fetches a URL by driving the SEALED system curl binary from outside (std::process only). Zero linked network/crypto dependencies; minimal immutable attack surface."
+
+[dependencies]
+cap-http = { workspace = true }
