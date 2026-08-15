@@ -4,7 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "WebSocket protocol crate (RFC 6455) — ws/wss handshake (driving the sealed system curl) + pure-Rust frame codec. No linked TLS/HTTP stack."
+description = "WebSocket protocol crate (RFC 6455) \u2014 ws/wss handshake + persistent connection (rustls TLS for wss) + pure-Rust frame codec."
 
 [dependencies]
 cap-http = { workspace = true }
+# Persistent wss:// connections need a TLS stack. rustls with the pure-Rust
+# `ring` provider is used (no C build chain). ws:// uses raw std::net TCP.
+# This is a deliberate, documented exception to the engine's "link no crypto"
+# posture: WebSocket is persistent, so the sealed-binary approach (which
+# returns the handshake and closes the data channel) cannot carry the
+# bidirectional frame stream.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+ring = "0.17"

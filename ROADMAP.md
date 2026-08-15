@@ -22,14 +22,25 @@ No backward compatibility with old/legacy protocols, by design.
   lived in `pbe-net`. Zero linked HTTP/TLS deps — same security posture
   as before, just in its own crate.
 - **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455). Splits the
-  protocol into its two concerns: the **handshake** (an HTTP `Upgrade`
-  request) drives the sealed system HTTP client with response headers
-  included, so no TLS/HTTP stack is linked; the **frame codec**
-  (`encode_frame`/`decode_frame`, opcode + masked payload, 7/16/64-bit
-  length) is pure Rust. The handshake + codec are complete and
-  unit-tested offline; a live persistent read/write loop is intentionally
-  not wired (it would need a socket primitive the engine does not yet
-  link — matching the doctrine: don't link what you don't need).
+  protocol into its two concerns: the **handshake** and the **frame codec**.
+  A persistent connection (`WsConnection::connect`) opens a real TCP socket
+  (TLS via `rustls` with the pure-Rust `ring` provider for `wss`), performs
+  the client opening handshake over the socket, verifies the
+  `Sec-WebSocket-Accept` against the key (RFC 6455 §4.2.2, using the test
+  vector as a regression), and then carries a send/recv frame loop
+  (`send_text`/`send_binary`/`recv`/`close`) over the live transport. The
+  frame codec (`encode_frame`/`decode_frame`, opcode + masked payload,
+  7/16/64-bit length, ping→pong, close acknowledgement) is pure Rust and is
+  also exposed standalone.
+
+  `wss://` links a TLS stack (`rustls` + `webpki-roots` + `ring`) — a
+  deliberate, documented exception to the "link no crypto" posture HTTP
+  still keeps, because WebSocket is *persistent*: the sealed-binary approach
+  returns the handshake response and closes the data channel, so it cannot
+  carry the bidirectional frame stream a live connection needs. HTTP, which
+  is request/response over a fresh connection each time, has no such need
+  and stays sealed-binary-driven. `ring` (pure-Rust crypto) is chosen over
+  `aws-lc-rs` to avoid pulling a C build chain into the engine.
 - **`pbe-proto-data`** — `data:` URIs (RFC 2397). Pure byte work, zero
   I/O, zero deps: split the media type from the data, base64-decode if
   `;base64` is set, else percent-decode. Defaults to
@@ -63,15 +74,23 @@ compatibility with old protocols.
 - `pbe-proto`: 6 tests (scheme routing, unsupported-scheme rejection).
 - `pbe-proto-http`: 8 tests (scheme rejection, sentinel split,
   non-UTF-8 byte preservation).
-- `pbe-proto-ws`: 13 tests (scheme rejection, key generation, frame
+- `pbe-proto-ws`: 25 tests (URL parsing, handshake-request construction,
+  RFC 6455 accept-key test vector, key/base64 generation, frame
   encode/decode round-trips, extended-length, masked-server rejection,
-  handshake-response parsing).
+  handshake-response parsing, **persistent-connection recv loop over a
+  loopback stream** (text frame read, ping→pong auto-answer, close handling,
+  incremental reads across single-byte chunks, masked-send verification)).
 - `pbe-proto-data`: 13 tests (text + base64 + binary, media-type
   defaults/parameters, error cases).
 - `pbe-net`: 9 tests (legacy facade rejection preserved, `data:` routes
   through, `Resource` conversions).
-- `pbe-shell`: 4 new scheme-classification + href-passthrough tests.
-- Full green sweep on the touched crates: `cargo test` (49 new tests,
+- `pbe-shell`: 4 scheme-classification + href-passthrough tests, plus 3
+  WebSocket-integration tests (poll/close/send on a browser with no open
+  connection). `Browser::open_websocket`/`poll_websocket`/`send_websocket`/
+  `close_websocket` wire the persistent connection into the browser so a
+  page can actually open a live `ws`/`wss` connection and receive
+  server-pushed messages.
+- Full green sweep on the touched crates: `cargo test` (66 new tests,
   all passing), `cargo clippy --all-targets -- -D warnings` clean,
   `cargo fmt --check` clean.
 - The pre-existing `cap-text-shape` test failures (cosmic-text needs

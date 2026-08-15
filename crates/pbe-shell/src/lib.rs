@@ -384,6 +384,12 @@ pub struct Browser {
     /// without a wrapper method — same fields `pmre-orchestrator`'s own
     /// examples mutate directly.
     pub ui: UiState,
+    /// Inbox of text messages received from the page's open WebSocket, if any.
+    /// Drained by [`poll_websocket`](Browser::poll_websocket) so a caller can
+    /// surface server pushes in the rendered page.
+    ws_inbox: Vec<String>,
+    /// The live WebSocket connection, if one is open.
+    ws: Option<pbe_proto_ws::WsConnection>,
 }
 
 impl Browser {
@@ -409,6 +415,8 @@ impl Browser {
             history: vec![origin],
             history_pos: 0,
             ui,
+            ws_inbox: Vec::new(),
+            ws: None,
         }
     }
 
@@ -440,6 +448,77 @@ impl Browser {
 
     pub fn reload(&mut self) {
         self.load_current();
+    }
+
+    /// Open a persistent WebSocket connection to a `ws://`/`wss://` URL. The
+    /// connection stays open and is drained by [`poll_websocket`]; received
+    /// text messages accumulate in an inbox the caller can surface in the
+    /// rendered page. Closing any previously-open connection first.
+    ///
+    /// This wires the modular `pbe-proto-ws` crate's persistent connection
+    /// into the browser: a page can actually open a live `ws`/`wss`
+    /// connection and receive server-pushed messages, not just fetch the
+    /// handshake. Returns `Err` if the connection or handshake fails.
+    pub fn open_websocket(&mut self, url: &str) -> Result<(), String> {
+        let conn = pbe_proto_ws::connect(url).map_err(|e| format!("{e:?}"))?;
+        // Close any existing connection before replacing it.
+        if let Some(mut prev) = self.ws.take() {
+            let _ = prev.close();
+        }
+        self.ws = Some(conn);
+        Ok(())
+    }
+
+    /// Send a text message over the open WebSocket, if any.
+    pub fn send_websocket(&mut self, text: &str) -> Result<(), String> {
+        let conn = self
+            .ws
+            .as_mut()
+            .ok_or_else(|| "no open websocket".to_string())?;
+        conn.send_text(text).map_err(|e| format!("{e:?}"))
+    }
+
+    /// Drain any received text/binary messages from the open WebSocket into
+    /// the inbox and return the messages received since the last poll.
+    /// Binary messages are hex-encoded so they survive the `String` inbox.
+    /// Closes the connection (and returns the inbox) if the peer closed.
+    pub fn poll_websocket(&mut self) -> Vec<String> {
+        let Some(conn) = self.ws.as_mut() else {
+            return std::mem::take(&mut self.ws_inbox);
+        };
+        loop {
+            match conn.recv() {
+                Ok(Some((opcode, payload))) => match opcode {
+                    pbe_proto_ws::Opcode::Text => {
+                        self.ws_inbox
+                            .push(String::from_utf8_lossy(&payload).to_string());
+                    }
+                    pbe_proto_ws::Opcode::Binary => {
+                        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+                        self.ws_inbox.push(hex);
+                    }
+                    _ => {}
+                },
+                Ok(None) => {
+                    // Peer closed; drop the connection.
+                    self.ws = None;
+                    break;
+                }
+                Err(_) => {
+                    // A read error (e.g. timeout with no data) means nothing
+                    // to drain right now; stop polling until next tick.
+                    break;
+                }
+            }
+        }
+        std::mem::take(&mut self.ws_inbox)
+    }
+
+    /// Close the open WebSocket, if any.
+    pub fn close_websocket(&mut self) {
+        if let Some(mut conn) = self.ws.take() {
+            let _ = conn.close();
+        }
     }
 
     /// Navigate to a new address (typed into the bar or otherwise supplied).
@@ -975,5 +1054,30 @@ mod resolve_href_tests {
             "wss://echo/x"
         );
         assert_eq!(resolve_href("https://x/page", "data:,hello"), "data:,hello");
+    }
+}
+
+#[cfg(test)]
+mod websocket_tests {
+    use crate::Browser;
+
+    #[test]
+    fn poll_with_no_open_connection_returns_empty() {
+        let mut b = Browser::open_html("<p>x</p>", 100, 100);
+        assert!(b.poll_websocket().is_empty());
+    }
+
+    #[test]
+    fn close_with_no_open_connection_is_a_noop() {
+        let mut b = Browser::open_html("<p>x</p>", 100, 100);
+        b.close_websocket();
+        // No panic; connection field stays None.
+        assert!(b.poll_websocket().is_empty());
+    }
+
+    #[test]
+    fn send_with_no_open_connection_errors() {
+        let mut b = Browser::open_html("<p>x</p>", 100, 100);
+        assert!(b.send_websocket("hi").is_err());
     }
 }

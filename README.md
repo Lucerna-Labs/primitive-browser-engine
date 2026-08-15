@@ -25,9 +25,10 @@ machine-local crate store.
 > rather than silently mis-handled — modern protocols only, no backward
 > compatibility with old protocols, by design.
 >
-> Verified: 49 new tests across the four new crates (6 + 8 + 13 + 13 + 9 in
-> `pbe-proto`/`-http`/`-ws`/`-data`/`pbe-net`), plus 4 new `pbe-shell`
-> scheme-classification tests; `cargo clippy --all-targets -- -D warnings`
+> Verified: 66 new tests across the protocol crates (6 + 8 + 25 + 13 + 9 in
+> `pbe-proto`/`-http`/`-ws`/`-data`/`pbe-net`), plus 7 `pbe-shell`
+> scheme-classification + WebSocket-integration tests;
+> `cargo clippy --all-targets -- -D warnings`
 > clean and `cargo fmt --check` clean across every touched crate. See the
 > updated Crates section below and `ROADMAP.md`.
 
@@ -248,9 +249,14 @@ applied to networking as to rendering. Consequences:
   own swappable crate behind it:
   - **`pbe-proto-http`** — `http`/`https`; drives the sealed system HTTP
     client binary via `std::process` (zero linked HTTP/TLS deps).
-  - **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455); handshake via
-    the sealed HTTP client (response headers included) + a pure-Rust frame
-    codec. No linked TLS/HTTP.
+  - **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455); persistent
+    connections via `WsConnection::connect` (TCP + rustls TLS for `wss`,
+    client handshake over the socket, then a send/recv frame loop) plus a
+    pure-Rust frame codec. `wss` links `rustls` (pure-Rust `ring` crypto) —
+    a deliberate exception to the "link no crypto" posture, because
+    WebSocket is persistent and the sealed-binary approach cannot carry the
+    bidirectional frame stream. `ws`/`ws(s)` URLs are wired into
+    `pbe-shell` via `Browser::open_websocket`/`poll_websocket`/`send_websocket`/`close_websocket`.
   - **`pbe-proto-data`** — `data:` URIs (RFC 2397); pure byte work, zero
     I/O, zero deps.
   Legacy schemes (`file://`, `ftp://`, `scp://`, …) are rejected as

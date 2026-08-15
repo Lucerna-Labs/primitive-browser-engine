@@ -51,6 +51,10 @@ use pbe_proto_ws as ws;
 pub use pbe_proto_data::DataError;
 pub use pbe_proto_http::HttpError;
 pub use pbe_proto_ws::WsError;
+// The persistent-connection + frame-codec API. `fetch`/`fetch_bytes` route a
+// URL to a one-shot Resource; for a live WebSocket a caller opens a
+// connection directly via `ws::connect`.
+pub use pbe_proto_ws::{connect as ws_connect, Opcode, Stream, WsConnection};
 
 /// A fetched resource — the one shared return type every protocol produces.
 ///

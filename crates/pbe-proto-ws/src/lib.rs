@@ -9,38 +9,47 @@
 //! WebSocket is two concerns under one protocol:
 //!
 //! 1. **The handshake** — an HTTP `Upgrade` request that establishes the
-//!    connection. This crate drives the **sealed system `curl` binary** with
-//!    `--include` for the handshake, so the engine links **no** HTTP or TLS
-//!    stack — the same "drive a sealed executor from outside, never link its
-//!    internals" doctrine as HTTP. `curl` performs the `wss://` TLS itself;
-//!    the engine only ever sees the handshake response bytes over a pipe.
+//!    connection. [`handshake`] drives the sealed system HTTP client with
+//!    `--include` and returns just the upgrade response (the legacy
+//!    one-shot entry point). [`WsConnection::connect`] performs the same
+//!    handshake **in-process** over a real socket, then keeps the socket
+//!    open for the frame exchange.
 //! 2. **The frame codec** — once upgraded, messages are RFC 6455 frames
-//!    (opcode + masked payload). This crate implements the codec in pure Rust:
-//!    [`encode_frame`] (client-to-server, always masked) and
-//!    [`decode_frame`] (server-to-client, never masked). No I/O, no deps
-//!    beyond the shared `cap-http` error type.
+//!    (opcode + masked payload). [`encode_frame`] (client-to-server, always
+//!    masked) and [`decode_frame`] (server-to-client, never masked) are pure
+//!    functions, used both by [`WsConnection`] and standalone.
 //!
-//! Splitting handshake (sealed process) from codec (pure bytes) keeps the
-//! security posture identical to HTTP: zero linked crypto, process isolation
-//! at the network boundary, immutable owned values everywhere.
+//! ## Persistent connections — [`WsConnection`]
 //!
-//! ## Status
+//! [`WsConnection::connect`] opens a real TCP connection to the WebSocket
+//! endpoint (TLS via `rustls` for `wss://`, raw for `ws://`), performs the
+//! client opening handshake over that socket, and returns a connection you
+//! can [`send`](WsConnection::send) and [`recv`](WsConnection::recv) text or
+//! binary frames over until [`close`](WsConnection::close).
 //!
-//! The handshake + codec are complete and unit-tested offline. A live
-//! read/write loop over the upgraded socket is intentionally not wired here:
-//! `curl --include` returns the handshake response and closes the data
-//! channel, so a true persistent connection needs a socket primitive the
-//! engine does not yet link (matching the doctrine: don't link what you
-//! don't need). The dispatch layer returns the handshake result as a
-//! [`Handshake`] resource; the codec is the swappable building block a future
-//! persistent-connection crate composes over.
+//! This links a TLS stack (`rustls` with the `ring` provider + the
+//! `webpki-roots` Mozilla trust store) into the engine — a deliberate
+//! exception to the "drive a sealed binary, link nothing" posture HTTP still
+//! keeps, because WebSocket is a *persistent* protocol: the sealed-binary
+//! approach returns the handshake response and closes the data channel, so
+//! it cannot carry the bidirectional frame stream a live connection needs.
+//! HTTP, which is request/response over a fresh connection each time, has no
+//! such need and stays sealed-binary-driven. `ring` (pure-Rust crypto) is
+//! chosen over `aws-lc-rs` to avoid pulling a C build chain into the engine.
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::process::Command;
+use std::time::Duration;
 
 pub use cap_http::HttpError as WsError;
 
-/// A completed WebSocket handshake — the on-ramp's concrete, immutable
-/// output. The dispatch layer's [`Resource`] is built `From` this.
+const TIMEOUT_SECS: u32 = 20;
+
+/// A completed WebSocket handshake — the one-shot entry's concrete, immutable
+/// output (drives the sealed HTTP client). For a live connection, use
+/// [`WsConnection::connect`] instead. The dispatch layer's [`Resource`] is
+/// built `From` this.
 #[derive(Clone, Debug)]
 pub struct Handshake {
     /// The upgraded endpoint URL (after any `wss://` TLS resolution).
@@ -54,13 +63,17 @@ pub struct Handshake {
 }
 
 /// Perform the WebSocket opening handshake for a `ws://`/`wss://` URL by
-/// driving the sealed system `curl` with `--include` (so the raw HTTP
+/// driving the sealed system HTTP client with `--include` (so the raw HTTP
 /// upgrade response is captured). A client key is generated; the response's
 /// `Sec-WebSocket-Accept` is returned for verification.
 ///
-/// Security posture: `curl` performs the TLS for `wss://` itself — we link
-/// no crypto. Only `ws`/`wss` schemes are accepted; anything else is
-/// rejected before a process is spawned.
+/// This is the **one-shot** entry point: it returns the handshake response
+/// and the connection is then closed by the sealed client. For a persistent
+/// connection you can send/recv frames over, use [`WsConnection::connect`].
+///
+/// Security posture: the sealed client performs the TLS for `wss://` itself.
+/// Only `ws`/`wss` schemes are accepted; anything else is rejected before a
+/// process is spawned.
 pub fn handshake(url: &str) -> Result<Handshake, WsError> {
     let scheme_ok = url.starts_with("ws://") || url.starts_with("wss://");
     if !scheme_ok {
@@ -69,9 +82,9 @@ pub fn handshake(url: &str) -> Result<Handshake, WsError> {
         )));
     }
 
-    // curl speaks http(s) natively, so map ws->http, wss->https for the
-    // handshake transport. The Upgrade headers below turn the HTTP request
-    // into a WebSocket one.
+    // The sealed client speaks http(s) natively, so map ws->http, wss->https
+    // for the handshake transport. The Upgrade headers below turn the HTTP
+    // request into a WebSocket one.
     let http_url = if let Some(rest) = url.strip_prefix("ws://") {
         format!("http://{rest}")
     } else if let Some(rest) = url.strip_prefix("wss://") {
@@ -127,37 +140,281 @@ pub fn handshake(url: &str) -> Result<Handshake, WsError> {
     })
 }
 
-/// Generate a client key. RFC 6455 §4.1: 16 random bytes, base64-encoded.
-/// Here we derive a fixed-but-varied key from the system clock so the crate
-/// stays dependency-free (a real RNG would add a dep; the handshake works
-/// with any 16-byte base64 string, and `curl` does not validate entropy).
-fn generate_key() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let bytes = [
-        (nanos & 0xff) as u8,
-        ((nanos >> 8) & 0xff) as u8,
-        ((nanos >> 16) & 0xff) as u8,
-        ((nanos >> 24) & 0xff) as u8,
-        ((nanos >> 32) & 0xff) as u8,
-        ((nanos >> 40) & 0xff) as u8,
-        ((nanos >> 48) & 0xff) as u8,
-        ((nanos >> 56) & 0xff) as u8,
-        0x50,
-        0x42,
-        0x45,
-        0x57,
-        0x53,
-        0x4b,
-        0x45,
-        0x59, // "PBEWSKEY"
-    ];
-    base64_encode(&bytes)
+/// A live, persistent WebSocket connection. Created with
+/// [`connect`](WsConnection::connect); send and recv text/binary frames
+/// until [`close`](WsConnection::close).
+///
+/// The underlying transport is a TCP socket (raw for `ws://`, TLS for
+/// `wss://` via `rustls`). Frames are encoded/decoded with the crate's
+/// pure-Rust codec ([`encode_frame`]/[`decode_frame`]).
+pub struct WsConnection {
+    stream: Box<dyn Stream>,
+    /// Buffer of bytes already read from the socket but not yet consumed by
+    /// a complete frame (decode is incremental).
+    read_buf: Vec<u8>,
 }
 
-/// Standard base64 encode of 16 bytes (RFC 4648). Dependency-free.
+/// The byte transport a [`WsConnection`] reads and writes over. Implemented
+/// for raw TCP (`ws://`) and rustls TLS streams (`wss://`). A trait so the
+/// connection logic is transport-agnostic and a test can substitute a
+/// loopback pair.
+pub trait Stream: Read + Write + Send {
+    /// Set the read/write timeout for the underlying transport.
+    fn set_timeout(&mut self, dur: Option<Duration>);
+}
+
+impl Stream for TcpStream {
+    fn set_timeout(&mut self, dur: Option<Duration>) {
+        let _ = TcpStream::set_read_timeout(self, dur);
+        let _ = TcpStream::set_write_timeout(self, dur);
+    }
+}
+
+/// Open a persistent WebSocket connection to a `ws://` or `wss://` URL.
+///
+/// Performs: DNS + TCP connect → optional TLS (rustls, `wss://`) → client
+/// opening handshake over the socket (write the `Upgrade` request, read the
+/// `101` response, verify `Sec-WebSocket-Accept`) → return a connection.
+///
+/// The returned connection is ready to [`send`](WsConnection::send) and
+/// [`recv`](WsConnection::recv) frames.
+pub fn connect(url: &str) -> Result<WsConnection, WsError> {
+    let (host, port, use_tls) = parse_ws_url(url)?;
+    let tcp = TcpStream::connect((host.as_str(), port))
+        .map_err(|e| WsError::Connection(format!("tcp connect to {host}:{port}: {e}")))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(TIMEOUT_SECS as u64)))
+        .ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(TIMEOUT_SECS as u64)))
+        .ok();
+
+    let key = generate_key();
+    let req = build_handshake_request(&host, port, &key);
+
+    let mut stream: Box<dyn Stream> = if use_tls {
+        Box::new(connect_tls(&host, tcp)?)
+    } else {
+        Box::new(tcp)
+    };
+
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| WsError::Connection(format!("write handshake: {e}")))?;
+
+    // Read until "\r\n\r\n" — the end of the HTTP response headers.
+    let mut resp = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| WsError::Connection(format!("read handshake: {e}")))?;
+        if n == 0 {
+            return Err(WsError::Connection("server closed during handshake".into()));
+        }
+        resp.push(byte[0]);
+        if resp.len() >= 4 && &resp[resp.len() - 4..] == b"\r\n\r\n" {
+            break;
+        }
+        if resp.len() > 64 * 1024 {
+            return Err(WsError::Connection("handshake response too large".into()));
+        }
+    }
+
+    let (status, accept) = parse_handshake_response(&resp);
+    if status != 101 {
+        return Err(WsError::Status(status));
+    }
+    // Verify the accept value matches the key (RFC 6455 §4.2.2).
+    let expected = compute_accept(&key);
+    if accept.as_deref() != Some(expected.as_str()) {
+        return Err(WsError::Tls("Sec-WebSocket-Accept mismatch".into()));
+    }
+
+    Ok(WsConnection {
+        stream,
+        read_buf: Vec::new(),
+    })
+}
+
+impl WsConnection {
+    /// Send a text message over the connection. The payload is encoded as a
+    /// single final text frame, masked (client-to-server per RFC 6455 §5.3).
+    pub fn send_text(&mut self, payload: &str) -> Result<(), WsError> {
+        self.send(Opcode::Text, payload.as_bytes())
+    }
+
+    /// Send a binary message over the connection.
+    pub fn send_binary(&mut self, payload: &[u8]) -> Result<(), WsError> {
+        self.send(Opcode::Binary, payload)
+    }
+
+    /// Low-level send: encode a frame with the given opcode + payload and
+    /// write it to the socket. A fresh random mask is generated per frame.
+    fn send(&mut self, opcode: Opcode, payload: &[u8]) -> Result<(), WsError> {
+        let mask = random_mask();
+        let frame = encode_frame(opcode, payload, &mask);
+        self.stream
+            .write_all(&frame)
+            .map_err(|e| WsError::Connection(format!("write frame: {e}")))
+    }
+
+    /// Receive the next message from the connection. Reads from the socket
+    /// until a complete frame is available, then returns its opcode + payload.
+    /// Control frames (ping/pong/close) are handled inline: a ping is
+    /// answered with a pong, a close is acknowledged and returns `Ok(None)`.
+    /// Returns `Ok(Some((opcode, payload)))` for a data or pong frame.
+    pub fn recv(&mut self) -> Result<Option<(Opcode, Vec<u8>)>, WsError> {
+        loop {
+            // Try to decode a frame from the buffer first.
+            if let Some((frame, consumed)) = decode_frame(&self.read_buf) {
+                self.read_buf.drain(..consumed);
+                match frame.opcode {
+                    Opcode::Ping => {
+                        // Answer with a pong carrying the ping's payload.
+                        let mask = random_mask();
+                        let pong = encode_frame(Opcode::Pong, &frame.payload, &mask);
+                        self.stream
+                            .write_all(&pong)
+                            .map_err(|e| WsError::Connection(format!("write pong: {e}")))?;
+                        continue;
+                    }
+                    Opcode::Close => {
+                        // Acknowledge close and signal end.
+                        let mask = random_mask();
+                        let ack = encode_frame(Opcode::Close, &frame.payload, &mask);
+                        let _ = self.stream.write_all(&ack);
+                        return Ok(None);
+                    }
+                    Opcode::Pong => continue,
+                    _ => return Ok(Some((frame.opcode, frame.payload))),
+                }
+            }
+            // Need more bytes.
+            let mut tmp = [0u8; 4096];
+            let n = self
+                .stream
+                .read(&mut tmp)
+                .map_err(|e| WsError::Connection(format!("read frame: {e}")))?;
+            if n == 0 {
+                return Err(WsError::Connection("connection closed by peer".into()));
+            }
+            self.read_buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// Send a close frame and shut down the connection cleanly.
+    pub fn close(&mut self) -> Result<(), WsError> {
+        let mask = random_mask();
+        let frame = encode_frame(Opcode::Close, &[], &mask);
+        let _ = self.stream.write_all(&frame);
+        let _ = self.stream.flush();
+        Ok(())
+    }
+}
+
+/// Parse a `ws://`/`wss://` URL into (host, port, use_tls).
+fn parse_ws_url(url: &str) -> Result<(String, u16, bool), WsError> {
+    let (use_tls, rest) = if let Some(r) = url.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("ws://") {
+        (false, r)
+    } else {
+        return Err(WsError::Connection(format!(
+            "refusing non-ws(s) URL: {url}"
+        )));
+    };
+    // Strip the path/query: the host is up to the first '/' or '?'.
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>()
+                .map_err(|_| WsError::Connection(format!("invalid port in URL: {url}")))?,
+        ),
+        None => (authority.to_string(), if use_tls { 443 } else { 80 }),
+    };
+    Ok((host, port, use_tls))
+}
+
+/// Build the HTTP `Upgrade` request bytes to send over the socket.
+fn build_handshake_request(host: &str, port: u16, key: &str) -> String {
+    // The Host header includes the port unless it's the scheme default.
+    let host_header = if (port == 80) || (port == 443) {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    format!(
+        "GET / HTTP/1.1\r\n\
+         Host: {host_header}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         \r\n"
+    )
+}
+
+/// Connect a rustls TLS stream over the given TCP socket for `host`.
+fn connect_tls(
+    host: &str,
+    tcp: TcpStream,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, WsError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let conn = rustls::ClientConnection::new(
+        std::sync::Arc::new(config),
+        rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| WsError::Tls(format!("invalid server name {host}: {e}")))?,
+    )
+    .map_err(|e| WsError::Tls(format!("tls connect: {e}")))?;
+    let mut stream = rustls::StreamOwned::new(conn, tcp);
+    stream
+        .flush()
+        .map_err(|e| WsError::Tls(format!("tls handshake: {e}")))?;
+    Ok(stream)
+}
+
+impl Stream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_timeout(&mut self, dur: Option<Duration>) {
+        let _ = self.get_ref().set_read_timeout(dur);
+        let _ = self.get_ref().set_write_timeout(dur);
+    }
+}
+
+/// Generate a client key (16 random bytes, base64). RFC 6455 §4.1.
+fn generate_key() -> String {
+    base64_encode(&random_bytes(16))
+}
+
+/// A random 4-byte masking key per frame (RFC 6455 §5.3).
+fn random_mask() -> [u8; 4] {
+    let b = random_bytes(4);
+    [b[0], b[1], b[2], b[3]]
+}
+
+/// Fill `n` bytes from the OS RNG (via `getrandom` through `ring`).
+fn random_bytes(n: usize) -> Vec<u8> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut out = vec![0u8; n];
+    rng.fill(&mut out).expect("ring rng failure");
+    out
+}
+
+/// Compute the expected `Sec-WebSocket-Accept` value for a given key:
+/// base64(sha1(key + GUID)). RFC 6455 §4.2.2.
+fn compute_accept(key: &str) -> String {
+    use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
+    let mut data = key.as_bytes().to_vec();
+    data.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let d = digest(&SHA1_FOR_LEGACY_USE_ONLY, &data);
+    base64_encode(d.as_ref())
+}
+
+/// Standard base64 encode of `bytes` (RFC 4648). Dependency-free.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -183,7 +440,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Parse the HTTP status code and `Sec-WebSocket-Accept` header from a raw
-/// `--include` response. Returns `(0, None)` if the status line is absent.
+/// response. Returns `(0, None)` if the status line is absent.
 fn parse_handshake_response(raw: &[u8]) -> (u16, Option<String>) {
     let text = String::from_utf8_lossy(raw);
     let mut status = 0u16;
@@ -207,9 +464,7 @@ fn parse_handshake_response(raw: &[u8]) -> (u16, Option<String>) {
     (status, accept)
 }
 
-const TIMEOUT_SECS: u32 = 20;
-
-/// WebSocket opcode (RFC 6455 £5.2).
+/// WebSocket opcode (RFC 6455 §5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Opcode {
     /// Continuation of a fragmented message.
@@ -252,7 +507,7 @@ pub struct Frame {
 }
 
 /// Encode a client-to-server WebSocket frame (always masked, per RFC 6455
-/// £5.3). Returns the wire bytes. The masking key is supplied by the
+/// §5.3). Returns the wire bytes. The masking key is supplied by the
 /// caller so tests are deterministic; a real client uses random bytes.
 pub fn encode_frame(opcode: Opcode, payload: &[u8], mask_key: &[u8; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 14);
@@ -340,6 +595,56 @@ pub fn decode_frame(buf: &[u8]) -> Option<(Frame, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Cursor, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// A test stream: writes append to a shared buffer the "server" reads;
+    /// reads pull from a shared buffer the "server" writes. Lets us test
+    /// WsConnection's send/recv loop offline against a scripted peer.
+    #[derive(Clone)]
+    struct LoopbackStream {
+        to_server: Arc<Mutex<Vec<u8>>>,
+        from_server: Arc<Mutex<Cursor<Vec<u8>>>>,
+    }
+
+    impl LoopbackStream {
+        fn new(server_writes: Vec<u8>) -> (Self, Self) {
+            let to_server = Arc::new(Mutex::new(Vec::new()));
+            let from_server = Arc::new(Mutex::new(Cursor::new(server_writes)));
+            (
+                LoopbackStream {
+                    to_server: to_server.clone(),
+                    from_server: from_server.clone(),
+                },
+                LoopbackStream {
+                    to_server,
+                    from_server,
+                },
+            )
+        }
+    }
+
+    impl Read for LoopbackStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut c = self.from_server.lock().unwrap();
+            c.read(buf)
+        }
+    }
+
+    impl Write for LoopbackStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut s = self.to_server.lock().unwrap();
+            s.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Stream for LoopbackStream {
+        fn set_timeout(&mut self, _dur: Option<Duration>) {}
+    }
 
     #[test]
     fn rejects_non_ws_scheme_without_spawning() {
@@ -353,6 +658,62 @@ mod tests {
     }
 
     #[test]
+    fn parse_ws_url_wss_default_port() {
+        let (host, port, tls) = parse_ws_url("wss://echo.example.com").unwrap();
+        assert_eq!(host, "echo.example.com");
+        assert_eq!(port, 443);
+        assert!(tls);
+    }
+
+    #[test]
+    fn parse_ws_url_ws_default_port() {
+        let (host, port, tls) = parse_ws_url("ws://echo.example.com").unwrap();
+        assert_eq!(host, "echo.example.com");
+        assert_eq!(port, 80);
+        assert!(!tls);
+    }
+
+    #[test]
+    fn parse_ws_url_explicit_port() {
+        let (host, port, tls) = parse_ws_url("wss://echo.example.com:8443/path").unwrap();
+        assert_eq!(host, "echo.example.com");
+        assert_eq!(port, 8443);
+        assert!(tls);
+    }
+
+    #[test]
+    fn parse_ws_url_rejects_non_ws() {
+        assert!(parse_ws_url("https://example.com").is_err());
+        assert!(parse_ws_url("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn build_handshake_request_is_well_formed() {
+        let req = build_handshake_request("example.com", 80, "dGhlIHNhbXBsZSBub25jZQ==");
+        assert!(req.starts_with("GET / HTTP/1.1\r\n"));
+        assert!(req.contains("Host: example.com\r\n"));
+        assert!(req.contains("Upgrade: websocket\r\n"));
+        assert!(req.contains("Connection: Upgrade\r\n"));
+        assert!(req.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
+        assert!(req.contains("Sec-WebSocket-Version: 13\r\n"));
+        assert!(req.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_handshake_request_includes_non_default_port() {
+        let req = build_handshake_request("example.com", 8080, "k");
+        assert!(req.contains("Host: example.com:8080\r\n"));
+    }
+
+    #[test]
+    fn compute_accept_matches_rfc_6455_test_vector() {
+        // RFC 6455 §4.2.2 example: key "dGhlIHNhbXBsZSBub25jZQ==" -> accept
+        // "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
+        let accept = compute_accept("dGhlIHNhbXBsZSBub25jZQ==");
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
     fn generates_a_24_char_base64_key() {
         // 16 bytes base64-encoded is always 24 chars (with padding).
         let key = generate_key();
@@ -361,21 +722,17 @@ mod tests {
     }
 
     #[test]
-    fn base64_encode_round_trips_with_decode() {
-        // Cross-check against a known vector.
-        let bytes = b"hello, websocket!";
-        let enc = base64_encode(bytes);
+    fn base64_encode_round_trips_with_known_vector() {
+        let enc = base64_encode(b"hello, websocket!");
         assert_eq!(enc, "aGVsbG8sIHdlYnNvY2tldCE=");
     }
 
     #[test]
     fn encode_text_frame_short_payload() {
         let out = encode_frame(Opcode::Text, b"hi", &[0x12, 0x34, 0x56, 0x78]);
-        // FIN=1, opcode=1, masked, len=2, mask, masked payload.
         assert_eq!(out[0], 0x81);
         assert_eq!(out[1], 0x82);
         assert_eq!(&out[2..6], &[0x12, 0x34, 0x56, 0x78]);
-        // 'h' ^ 0x12, 'i' ^ 0x34
         assert_eq!(out[6], b'h' ^ 0x12);
         assert_eq!(out[7], b'i' ^ 0x34);
     }
@@ -407,7 +764,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_masked_server_frame() {
-        // A masked server-to-client frame is a protocol violation.
         let wire = [0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0, 0];
         assert!(decode_frame(&wire).is_none());
     }
@@ -426,9 +782,7 @@ mod tests {
 
     #[test]
     fn decode_returns_none_when_incomplete() {
-        // First byte only.
         assert!(decode_frame(&[0x81]).is_none());
-        // Length announced but payload not all there yet.
         assert!(decode_frame(&[0x81, 0x05, b'a']).is_none());
     }
 
@@ -467,5 +821,123 @@ mod tests {
         let (status, accept) = parse_handshake_response(raw);
         assert_eq!(status, 0);
         assert_eq!(accept, None);
+    }
+
+    /// Build a `WsConnection` over a loopback pair whose "server" side has
+    /// already written the given bytes. Lets us test recv() offline.
+    fn conn_over(server_writes: Vec<u8>) -> (WsConnection, LoopbackStream) {
+        let (client_stream, server_stream) = LoopbackStream::new(server_writes);
+        let conn = WsConnection {
+            stream: Box::new(client_stream),
+            read_buf: Vec::new(),
+        };
+        (conn, server_stream)
+    }
+
+    #[test]
+    fn recv_reads_a_text_frame_from_the_stream() {
+        // A server-sent text frame "hi" (unmasked).
+        let mut server_bytes = vec![0x81, 0x02, b'h', b'i'];
+        let (mut conn, _server) = conn_over(std::mem::take(&mut server_bytes));
+        let msg = conn.recv().unwrap().unwrap();
+        assert_eq!(msg.0, Opcode::Text);
+        assert_eq!(msg.1, b"hi".to_vec());
+    }
+
+    #[test]
+    fn recv_answers_a_ping_with_a_pong() {
+        // Server sends a ping with payload "x", then a text frame "yo".
+        let server_bytes: Vec<u8> = vec![
+            0x89, 0x01, b'x', // ping
+            0x81, 0x02, b'y', b'o', // text
+        ];
+        let (mut conn, server) = conn_over(server_bytes);
+        let msg = conn.recv().unwrap().unwrap();
+        assert_eq!(msg.0, Opcode::Text);
+        assert_eq!(msg.1, b"yo".to_vec());
+        // The pong we wrote back should be on the server's recv buffer.
+        let written = server.to_server.lock().unwrap().clone();
+        // Pong frame: FIN+pong(0xA), masked, len 1, 4 mask bytes, 1 masked byte.
+        assert_eq!(written[0], 0x8A);
+        assert_eq!(written[1] & 0x80, 0x80); // mask bit set
+        assert_eq!(written[1] & 0x7f, 1); // payload len 1
+    }
+
+    #[test]
+    fn recv_on_close_returns_none() {
+        // Server sends a close frame (no payload).
+        let server_bytes: Vec<u8> = vec![0x88, 0x00];
+        let (mut conn, _server) = conn_over(server_bytes);
+        assert!(conn.recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn recv_assembles_a_frame_across_reads() {
+        // The same text frame "hi" but fed in two chunks via a stream that
+        // yields 1 byte per read until exhausted.
+        struct OneByteStream {
+            buf: Vec<u8>,
+            pos: usize,
+            written: Vec<u8>,
+        }
+        impl Read for OneByteStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.buf.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.buf[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        impl Write for OneByteStream {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Stream for OneByteStream {
+            fn set_timeout(&mut self, _d: Option<Duration>) {}
+        }
+        let s = OneByteStream {
+            buf: vec![0x81, 0x02, b'h', b'i'],
+            pos: 0,
+            written: Vec::new(),
+        };
+        let mut conn = WsConnection {
+            stream: Box::new(s),
+            read_buf: Vec::new(),
+        };
+        let msg = conn.recv().unwrap().unwrap();
+        assert_eq!(msg.1, b"hi".to_vec());
+    }
+
+    #[test]
+    fn send_text_writes_a_masked_text_frame() {
+        // Build a connection whose server side records what we write. Hold a
+        // clone of the shared write-buffer (LoopbackStream uses Arc<Mutex>)
+        // so we can inspect what send_text wrote without downcasting the
+        // boxed trait object.
+        let (client_stream, _server) = LoopbackStream::new(Vec::new());
+        let write_buf = client_stream.to_server.clone();
+        let mut conn = WsConnection {
+            stream: Box::new(client_stream),
+            read_buf: Vec::new(),
+        };
+        conn.send_text("hi").unwrap();
+        let written = write_buf.lock().unwrap().clone();
+        assert_eq!(written[0], 0x81); // FIN + text
+        assert_eq!(written[1], 0x82); // masked, len 2
+        let mask = &written[2..6];
+        let payload = &written[6..8];
+        let unmasked: Vec<u8> = payload
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ mask[i % 4])
+            .collect();
+        assert_eq!(unmasked, b"hi");
     }
 }
