@@ -10,11 +10,14 @@
 //! chrome (the buttons/input around it) — the two things `pmre-kit` doesn't
 //! have an opinion on.
 
+use pbe_js::{DomHooks, FetchHook, JsRuntime, LogSink};
 use pmre_kit::raster::{decode_bmp, decode_png, Image};
 use pmre_kit::ux::{Align, Dim, Edges, Justify, Style, UxNode};
 use pmre_kit::{Framebuffer, Rgba};
 use pmre_orchestrator::UiState;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub use pmre_orchestrator::{handle_event, render_ui, render_ui_quality, Quality, UiEvent};
@@ -96,10 +99,108 @@ fn load(origin: &Origin) -> (String, UxNode) {
     // never fetches or decodes anything the browser hasn't already given it —
     // the composition boundary stays at the browser layer.
     let images = fetch_page_images(&label, &augmented);
+    // Run any <script> blocks through the JS engine (boa). Page scripts can
+    // mutate document.title (reflected in the returned label) and call
+    // fetch() through the engine's own protocol layer. Script errors are
+    // non-fatal — a failing script logs + continues, like a real browser.
+    let label = run_scripts(&label, &augmented);
     (
         label,
         pmre_kit::html::parse_with_images(&augmented, &images),
     )
+}
+
+/// Scan `html` for `<script>...</script>` blocks and run each through a fresh
+/// [`JsRuntime`] with the browser's hooks installed: `console.log` → stderr,
+/// `document.title` get/set → the page label, `fetch(url)` → the engine's
+/// protocol layer. Returns the (possibly JS-mutated) page label. Per-script
+/// failures are non-fatal — logged to stderr, never aborting the page load
+/// (matching real-browser behaviour). External `<script src=...>` is a future
+/// extension; today only inline scripts run.
+fn run_scripts(label: &str, html: &str) -> String {
+    let scripts = find_inline_scripts(html);
+    if scripts.is_empty() {
+        return label.to_string();
+    }
+    let title: Rc<RefCell<String>> = Rc::new(RefCell::new(label.to_string()));
+    let log: Rc<RefCell<dyn LogSink>> = Rc::new(RefCell::new(StderrLog));
+    let dom: Rc<RefCell<dyn DomHooks>> = Rc::new(RefCell::new(TitleDom {
+        title: title.clone(),
+    }));
+    let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(ProtoFetch));
+    let mut rt = JsRuntime::with_bindings(log, dom, fetch);
+    for src in &scripts {
+        if let Err(e) = rt.run(src) {
+            eprintln!("script error: {e}");
+        }
+    }
+    let final_title = title.borrow().clone();
+    final_title
+}
+
+/// Extract the content of each `<script>...</script>` block in source order.
+/// Tolerant of attribute-bearing `<script type="...">` opening tags and
+/// unclosed scripts. The kit's HTML reducer skips `<script>` content during
+/// parse (it never reaches the render tree); this composition runs it
+/// separately before parse so page logic can execute.
+fn find_inline_scripts(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("<script").map(|k| i + k) {
+        let tag_start = rel;
+        let Some(close_rel) = lower[tag_start..].find('>') else {
+            break;
+        };
+        let body_start = tag_start + close_rel + 1;
+        // Find the matching </script>.
+        let Some(end_rel) = lower[body_start..].find("</script>") else {
+            // Unclosed script: take the rest as script content (lenient).
+            out.push(html[body_start..].to_string());
+            break;
+        };
+        let body_end = body_start + end_rel;
+        out.push(html[body_start..body_end].to_string());
+        i = body_end + "</script>".len();
+    }
+    out
+}
+
+/// A console sink that writes to stderr (the same place the orchestrator
+/// binary prints fetch progress).
+struct StderrLog;
+impl LogSink for StderrLog {
+    fn log(&mut self, msg: &str) {
+        eprintln!("console: {msg}");
+    }
+    fn error(&mut self, msg: &str) {
+        eprintln!("console.error: {msg}");
+    }
+}
+
+/// DOM hook: `document.title` get/set backed by the page label.
+struct TitleDom {
+    title: Rc<RefCell<String>>,
+}
+impl DomHooks for TitleDom {
+    fn get_title(&self) -> String {
+        self.title.borrow().clone()
+    }
+    fn set_title(&mut self, title: String) {
+        *self.title.borrow_mut() = title;
+    }
+}
+
+/// Fetch hook: route JS `fetch(url)` through the engine's modular protocol
+/// layer (pbe_proto), which dispatches http/ws/data. Returns (status, text).
+struct ProtoFetch;
+impl FetchHook for ProtoFetch {
+    fn fetch(&mut self, url: &str) -> (u16, String) {
+        match pbe_proto::fetch(url) {
+            Ok(r) => (r.status, r.text()),
+            Err(e) => (0, format!("fetch error: {e}")),
+        }
+    }
 }
 
 /// Scan `html` for `<img src="…">` tags, fetch and decode each into an
@@ -1107,5 +1208,42 @@ mod websocket_tests {
     fn send_with_no_open_connection_errors() {
         let mut b = Browser::open_html("<p>x</p>", 100, 100);
         assert!(b.send_websocket("hi").is_err());
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use crate::Browser;
+
+    #[test]
+    fn inline_script_sets_document_title() {
+        // A page whose <script> sets document.title should surface that title
+        // as the browser's page label (the JS engine runs during load).
+        let b = Browser::open_html(
+            r#"<script>document.setTitle("from-js")</script><p>hi</p>"#,
+            100,
+            100,
+        );
+        assert_eq!(b.label(), "from-js");
+    }
+
+    #[test]
+    fn a_failing_script_does_not_abort_the_page() {
+        // A script that throws must not abort the load; the page still
+        // renders (label is whatever it was before the throw).
+        let b = Browser::open_html(
+            r#"<script>throw new Error("boom")</script><p>still here</p>"#,
+            100,
+            100,
+        );
+        // Label isn't "from-js" (no setTitle ran), and the page loaded.
+        assert_ne!(b.label(), "from-js");
+    }
+
+    #[test]
+    fn script_without_a_settitle_keeps_the_default_label() {
+        let b = Browser::open_html(r#"<script>var x = 1 + 1;</script><p>hi</p>"#, 100, 100);
+        // about:blank is the default label for an Html origin.
+        assert_eq!(b.label(), "about:blank");
     }
 }

@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 pbe-net = { workspace = true }
+pbe-proto = { workspace = true }
 pbe-proto-ws = { workspace = true }
 pbe-img-codecs = { workspace = true }
+pbe-js = { workspace = true }
 pmre-kit = { workspace = true }
 pmre-orchestrator = { workspace = true }
 # Real OS window + event loop, and a CPU framebuffer presenter (the engine's
