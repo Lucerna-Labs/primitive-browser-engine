@@ -145,14 +145,16 @@ fn fetch_image_bytes(target: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Try BMP and PNG decoders in turn on the given bytes. Returns `None` if
-/// neither format matches — future decoders (JPEG, WebP, GIF) would join the
-/// same dispatch here.
+/// Try the kit's BMP/PNG decoders, then the modular `pbe-img-codecs` crate
+/// (JPEG/WebP/GIF) on the given bytes. Returns `None` if no decoder matches
+/// — the browser renders the alt text in that case, never aborts the page.
 fn decode_image_bytes(bytes: &[u8]) -> Option<Image> {
     if bytes.starts_with(b"BM") {
         decode_bmp(bytes)
     } else if bytes.len() >= 8 && bytes[0..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
         decode_png(bytes)
+    } else if pbe_img_codecs::handles(bytes) {
+        pbe_img_codecs::decode(bytes)
     } else {
         None
     }
@@ -908,6 +910,32 @@ mod image_scan_tests {
     fn decode_dispatch_rejects_unknown_format() {
         assert!(decode_image_bytes(b"JPEG").is_none());
         assert!(decode_image_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn decode_dispatch_routes_jpeg_to_img_codecs() {
+        // Synthesize a real 3x2 JPEG and confirm the dispatch routes it to
+        // pbe-img-codecs (not BMP/PNG) and decodes the dimensions back.
+        let img = image::RgbImage::from_pixel(3, 2, image::Rgb([40, 90, 160]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        let decoded = decode_image_bytes(&buf.into_inner()).expect("jpeg should decode");
+        assert_eq!(decoded.width, 3);
+        assert_eq!(decoded.height, 2);
+    }
+
+    #[test]
+    fn decode_dispatch_routes_webp_to_img_codecs() {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([15, 200, 75]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::WebP)
+            .unwrap();
+        let decoded = decode_image_bytes(&buf.into_inner()).expect("webp should decode");
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
     }
 }
 

@@ -9,6 +9,7 @@ members = [
     "crates/pbe-proto-http",
     "crates/pbe-proto-ws",
     "crates/pbe-proto-data",
+    "crates/pbe-img-codecs",
     "crates/pbe-text",
     "crates/pbe-orchestrator",
     "crates/pbe-shell",
@@ -90,5 +91,11 @@ pbe-proto-http = { path = "crates/pbe-proto-http" }
 pbe-proto-ws = { path = "crates/pbe-proto-ws" }
 pbe-proto-data = { path = "crates/pbe-proto-data" }
 
+pmre-core = { path = "crates/pmre-core" }
+pmre-raster = { path = "crates/pmre-raster" }
 pmre-kit = { path = "crates/pmre-kit" }
 pmre-orchestrator = { path = "crates/pmre-orchestrator" }
+# Image codec crates (JPEG/WebP/GIF) — one swappable crate, decodes to the
+# kit's Image type. The in-kit BMP/PNG decoders stay zero-dep; these add the
+# formats most real web images use, behind a modular boundary.
+pbe-img-codecs = { path = "crates/pbe-img-codecs" }
