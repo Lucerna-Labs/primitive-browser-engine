@@ -10,6 +10,7 @@ members = [
     "crates/pbe-proto-ws",
     "crates/pbe-proto-data",
     "crates/pbe-img-codecs",
+    "crates/pbe-js",
     "crates/pbe-text",
     "crates/pbe-orchestrator",
     "crates/pbe-shell",
@@ -99,3 +100,5 @@ pmre-orchestrator = { path = "crates/pmre-orchestrator" }
 # kit's Image type. The in-kit BMP/PNG decoders stay zero-dep; these add the
 # formats most real web images use, behind a modular boundary.
 pbe-img-codecs = { path = "crates/pbe-img-codecs" }
+# JavaScript engine (boa, pure-Rust) + minimal DOM/console/fetch bindings.
+pbe-js = { path = "crates/pbe-js" }
