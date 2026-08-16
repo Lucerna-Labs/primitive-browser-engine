@@ -217,12 +217,30 @@ pub fn parse_with_images_and_interaction(
     images: &HashMap<String, Arc<Image>>,
     interaction: InteractionState,
 ) -> UxNode {
+    parse_with_images_interaction_viewport(
+        src,
+        images,
+        interaction,
+        crate::css::Viewport::default(),
+    )
+}
+
+/// The fully-parameterized parse: HTML + images + interaction state + viewport.
+/// `@media` queries are evaluated against `vp`; `:hover`/`:focus` against
+/// `interaction`. The browser calls this on every render with the current
+/// window size and hover/focus state.
+pub fn parse_with_images_interaction_viewport(
+    src: &str,
+    images: &HashMap<String, Arc<Image>>,
+    interaction: InteractionState,
+    vp: crate::css::Viewport,
+) -> UxNode {
     let toks = tokenize(src);
     let mut pos = 0usize;
     let roots = parse_nodes(&toks, &mut pos, None, 0);
     let mut style_text = String::new();
     collect_style_text(&roots, &mut style_text);
-    let sheet = css::parse_stylesheet(&style_text);
+    let sheet = css::parse_stylesheet_with_viewport(&style_text, vp);
     let mut ancestors: Vec<AncestorStackFrame> = Vec::new();
     let ids = IdAlloc::new();
     let kids = children_to_ux(

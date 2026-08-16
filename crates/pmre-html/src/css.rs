@@ -353,7 +353,85 @@ fn match_chain(
 /// Parse a stylesheet's combined text (the concatenation of every `<style>`
 /// block's content) into an ordered rule list. Tolerant: a chunk that
 /// doesn't parse as `selectors { declarations }` is skipped, never panics.
+/// The viewport dimensions the browser supplies for `@media` query matching.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+fn media_matches(query: &str, vp: Viewport) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() || q == "all" || q == "screen" || q == "only screen" {
+        return true;
+    }
+    if q.starts_with("print") {
+        return false;
+    }
+    let mut ok = true;
+    let bytes = q.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let close = match q[i..].find(')') {
+                Some(c) => i + c,
+                None => return true,
+            };
+            let cond = &q[i + 1..close];
+            ok = ok && parse_media_cond(cond, vp).unwrap_or(true);
+            i = close + 1;
+        } else {
+            i += 1;
+        }
+    }
+    ok
+}
+
+fn parse_media_cond(cond: &str, vp: Viewport) -> Option<bool> {
+    let (feat, val) = cond.split_once(':')?;
+    let feat = feat.trim();
+    let val = val.trim().trim_end_matches("px").trim();
+    let n: u32 = val.parse().ok()?;
+    match feat {
+        "max-width" => Some(vp.width <= n),
+        "min-width" => Some(vp.width >= n),
+        "max-height" => Some(vp.height <= n),
+        "min-height" => Some(vp.height >= n),
+        _ => None,
+    }
+}
+
+/// Find the index (relative to `s[start..]`) of the `}` that closes the block
+/// opened at `start` (which points just after the opening `{`). Handles nested
+/// braces so `@media { p { } }` closes at the outer `}`. Returns None if
+/// unbalanced.
+fn find_matching_brace(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn parse_stylesheet(css: &str) -> Vec<Rule> {
+    parse_stylesheet_with_viewport(css, Viewport::default())
+}
+
+/// Like [`parse_stylesheet`] but the caller supplies the [`Viewport`] so
+/// `@media (...) { ... }` blocks are kept only when their query matches.
+pub fn parse_stylesheet_with_viewport(css: &str, vp: Viewport) -> Vec<Rule> {
     let mut rules = Vec::new();
     let mut order = 0usize;
     let mut i = 0usize;
@@ -373,14 +451,39 @@ pub fn parse_stylesheet(css: &str) -> Vec<Rule> {
             continue;
         }
         let Some(brace) = css[i..].find('{') else {
-            break; // trailing garbage after the last rule — stop cleanly
+            break;
         };
         let selector_text = &css[i..i + brace];
-        let Some(close_rel) = css[i + brace + 1..].find('}') else {
-            break; // unterminated block — stop cleanly
-        };
+        // Find the matching close brace (depth-aware, so @media blocks with
+        // nested rule braces close at the right spot).
         let decl_start = i + brace + 1;
-        let decl_end = decl_start + close_rel;
+        let Some(close_abs) = find_matching_brace(css, decl_start) else {
+            break;
+        };
+        let decl_end = close_abs;
+        let body = &css[decl_start..decl_end];
+        if selector_text
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("@media")
+        {
+            let query = selector_text.trim().trim_start_matches("@media");
+            if media_matches(query, vp) {
+                let inner = parse_stylesheet_with_viewport(body, vp);
+                for r in inner {
+                    let mut r = r;
+                    r.order = order;
+                    order += 1;
+                    rules.push(r);
+                }
+            }
+            i = decl_end + 1;
+            continue;
+        }
+        if selector_text.trim().starts_with('@') {
+            i = decl_end + 1;
+            continue;
+        }
         let chains: Vec<Chain> = selector_text
             .split(',')
             .filter_map(parse_selector)
@@ -388,7 +491,7 @@ pub fn parse_stylesheet(css: &str) -> Vec<Rule> {
         if !chains.is_empty() {
             rules.push(Rule {
                 chains,
-                declarations: css[decl_start..decl_end].to_string(),
+                declarations: body.to_string(),
                 order,
             });
             order += 1;
@@ -1054,6 +1157,123 @@ mod tests {
             &[]
         )
         .is_some());
+    }
+
+    #[test]
+    fn media_max_width_keeps_rule_when_viewport_narrow() {
+        let css = "@media (max-width: 600px) { p { width: 999px; } }";
+        // Narrow viewport (400px) -> rule kept.
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 400,
+                    height: 800
+                }
+            )
+            .len(),
+            1
+        );
+        // Wide viewport (800px) -> rule dropped.
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 800,
+                    height: 800
+                }
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn media_min_width_keeps_rule_when_viewport_wide() {
+        let css = "@media (min-width: 800px) { div { width: 500px; } }";
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 1000,
+                    height: 800
+                }
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 500,
+                    height: 800
+                }
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn media_screen_always_matches() {
+        let css = "@media screen { p { width: 999px; } }";
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 1920,
+                    height: 1080
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn media_print_is_dropped() {
+        let css = "@media print { p { width: 999px; } }";
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 1920,
+                    height: 1080
+                }
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn media_block_can_contain_multiple_rules() {
+        let css = "@media (max-width: 600px) { p { width: 1px; } div { height: 2px; } }";
+        assert_eq!(
+            parse_stylesheet_with_viewport(
+                css,
+                Viewport {
+                    width: 400,
+                    height: 800
+                }
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rules_outside_media_always_parse() {
+        let css = "p { width: 10px; } @media (max-width: 600px) { div { width: 20px; } }";
+        let rules = parse_stylesheet_with_viewport(
+            css,
+            Viewport {
+                width: 800,
+                height: 800,
+            },
+        );
+        assert_eq!(rules.len(), 1); // only the non-media rule
     }
 
     #[test]
