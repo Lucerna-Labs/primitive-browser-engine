@@ -717,16 +717,19 @@ fn borrow_ancestors<'a>(
 fn matched_rules<'a>(
     sheet: &'a [Rule],
     ancestors: &[AncestorStackFrame],
+    siblings: &[AncestorStackFrame],
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
 ) -> Vec<&'a Rule> {
-    let mut scratch: Vec<Vec<&str>> = Vec::with_capacity(ancestors.len());
-    let borrowed = borrow_ancestors(ancestors, &mut scratch);
+    let mut scratch_a: Vec<Vec<&str>> = Vec::with_capacity(ancestors.len());
+    let borrowed_a = borrow_ancestors(ancestors, &mut scratch_a);
+    let mut scratch_s: Vec<Vec<&str>> = Vec::with_capacity(siblings.len());
+    let borrowed_s = borrow_ancestors(siblings, &mut scratch_s);
     let mut matched: Vec<(&Rule, (u32, u32, u32))> = sheet
         .iter()
         .filter_map(|r| {
-            r.specificity_if_matches(&borrowed, tag, id, classes)
+            r.specificity_if_matches(&borrowed_a, &borrowed_s, tag, id, classes)
                 .map(|sp| (r, sp))
         })
         .collect();
@@ -763,13 +766,14 @@ fn apply_cascade(
     inh: &mut Inherited,
     sheet: &[Rule],
     ancestors: &[AncestorStackFrame],
+    siblings: &[AncestorStackFrame],
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
     inline_style: Option<&str>,
 ) -> bool {
     let mut hidden = false;
-    for r in matched_rules(sheet, ancestors, tag, id, classes) {
+    for r in matched_rules(sheet, ancestors, siblings, tag, id, classes) {
         apply_css(style, inh, &r.declarations);
         if let Some(is_none) = declares_display_none(&r.declarations) {
             hidden = is_none;
@@ -813,6 +817,9 @@ fn children_to_ux(
     let mut out: Vec<UxNode> = Vec::new();
     let mut run: Vec<Span> = Vec::new();
     let mut first_flush = true;
+    // Preceding sibling elements within this parent, nearest-last, so + / ~
+    // combinators can match. Reset per children_to_ux call (per parent).
+    let mut prev_siblings: Vec<AncestorStackFrame> = Vec::new();
     // Sequential index of the current `<li>` sibling under this list — only
     // used when `parent_list` is `Ordered`; increments as each `<li>` is
     // dispatched so the numeric prefix reflects source order.
@@ -874,7 +881,15 @@ fn children_to_ux(
                     sheet,
                     &mut run,
                     ancestors,
+                    &prev_siblings,
                 );
+                // Record this inline element as a preceding sibling for the
+                // next sibling's + / ~ combinators.
+                prev_siblings.push((
+                    tag.to_string(),
+                    id_attr.as_deref().map(str::to_string),
+                    classes.to_vec(),
+                ));
                 if flex_row {
                     flush(&mut run, &mut out, &mut first_flush);
                 }
@@ -920,8 +935,16 @@ fn children_to_ux(
                     images,
                     ancestors,
                     ids,
+                    &prev_siblings,
                 ) {
                     out.push(node);
+                    // Record this block element as a preceding sibling for
+                    // the next sibling's + / ~ combinators.
+                    prev_siblings.push((
+                        tag.to_string(),
+                        id_attr.as_deref().map(str::to_string),
+                        classes.to_vec(),
+                    ));
                 }
             }
         }
@@ -959,6 +982,7 @@ fn inline_spans(
     sheet: &[Rule],
     run: &mut Vec<Span>,
     ancestors: &mut Vec<AncestorStackFrame>,
+    siblings: &[AncestorStackFrame],
 ) {
     let mut inh = inh;
     inh.font_size = tag_font(tag, inh.font_size);
@@ -981,6 +1005,7 @@ fn inline_spans(
         &mut inh,
         sheet,
         ancestors,
+        siblings,
         tag,
         id,
         &class_refs,
@@ -1017,6 +1042,9 @@ fn inline_spans(
                     sheet,
                     run,
                     ancestors,
+                    // Nested inline elements have no block-sibling context to
+                    // carry here (they coalesce into the same Rich flow).
+                    &[],
                 )
             }
             _ => {} // block inside inline: out of subset, dropped
@@ -1040,6 +1068,7 @@ fn elem_to_ux(
     images: &HashMap<String, Arc<Image>>,
     ancestors: &mut Vec<AncestorStackFrame>,
     ids: &IdAlloc,
+    siblings: &[AncestorStackFrame],
 ) -> Option<UxNode> {
     // <img>: emit a UxNode::Image if the src is in the pre-fetched map, drop
     // otherwise. This runs *before* `is_dropped(tag)` so an img with a hit
@@ -1081,6 +1110,7 @@ fn elem_to_ux(
             &mut inh2,
             sheet,
             ancestors,
+            siblings,
             tag,
             id,
             &class_refs,
@@ -1127,6 +1157,7 @@ fn elem_to_ux(
         &mut inh2,
         sheet,
         ancestors,
+        siblings,
         tag,
         id,
         &class_refs,
@@ -1901,6 +1932,51 @@ mod tests {
             count_p_with_width(&root, 999.0),
             1,
             "child combinator should match exactly the direct-child <p>"
+        );
+    }
+
+    #[test]
+    fn adjacent_sibling_combinator_applies() {
+        // h1 + p applies to a <p> that immediately follows an <h1> sibling,
+        // but not to a <p> that follows a <div> sibling.
+        let doc = r#"<style>h1 + p { width: 999px; }</style>
+            <div><h1>title</h1><p id="after-h1"></p><div>x</div><p id="after-div"></p></div>"#;
+        let root = parse(doc);
+        fn count_p_with_width(node: &UxNode, want: f32) -> usize {
+            if let UxNode::Box { style, children } = node {
+                let self_match = matches!(style.width, Dim::Px(w) if (w - want).abs() < 0.01);
+                let kids: usize = children.iter().map(|c| count_p_with_width(c, want)).sum();
+                (if self_match { 1 } else { 0 }) + kids
+            } else {
+                0
+            }
+        }
+        assert_eq!(
+            count_p_with_width(&root, 999.0),
+            1,
+            "adjacent sibling should match exactly the <p> right after <h1>"
+        );
+    }
+
+    #[test]
+    fn general_sibling_combinator_applies() {
+        // h1 ~ p applies to every <p> that follows an <h1> sibling (two here).
+        let doc = r#"<style>h1 ~ p { width: 777px; }</style>
+            <div><h1>t</h1><p></p><div>x</div><p></p></div>"#;
+        let root = parse(doc);
+        fn count_p_with_width(node: &UxNode, want: f32) -> usize {
+            if let UxNode::Box { style, children } = node {
+                let self_match = matches!(style.width, Dim::Px(w) if (w - want).abs() < 0.01);
+                let kids: usize = children.iter().map(|c| count_p_with_width(c, want)).sum();
+                (if self_match { 1 } else { 0 }) + kids
+            } else {
+                0
+            }
+        }
+        assert_eq!(
+            count_p_with_width(&root, 777.0),
+            2,
+            "general sibling should match both <p>s after the <h1>"
         );
     }
 

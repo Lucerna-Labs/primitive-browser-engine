@@ -134,6 +134,10 @@ pub enum Combinator {
     Descendant,
     /// `A > B` — B is a direct child of A.
     Child,
+    /// `A + B` — B immediately follows sibling A (same parent, adjacent).
+    AdjacentSibling,
+    /// `A ~ B` — B follows sibling A (same parent, any later position).
+    GeneralSibling,
 }
 
 /// One step in a selector chain: a compound selector plus the combinator
@@ -180,13 +184,14 @@ impl Rule {
     pub fn specificity_if_matches(
         &self,
         ancestors: &[AncestorFrame<'_>],
+        siblings: &[AncestorFrame<'_>],
         tag: &str,
         id: Option<&str>,
         classes: &[&str],
     ) -> Option<(u32, u32, u32)> {
         self.chains
             .iter()
-            .filter_map(|chain| match_chain(chain, ancestors, tag, id, classes))
+            .filter_map(|chain| match_chain(chain, ancestors, siblings, tag, id, classes))
             .max()
     }
 }
@@ -203,16 +208,16 @@ impl Rule {
 fn match_chain(
     chain: &[ChainStep],
     ancestors: &[AncestorFrame<'_>],
+    siblings: &[AncestorFrame<'_>],
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
 ) -> Option<(u32, u32, u32)> {
-    // Walk the chain right-to-left (element first, then its ancestors). The
-    // combinator that governs the relationship between step `i` and the
+    // Walk the chain right-to-left (element first, then its ancestors/siblings).
+    // The combinator that governs the relationship between step `i` and the
     // element/step to its *right* lives on step `i+1` (or `last`). So when
-    // matching an ancestor for step `rest[i]`, we consult the combinator of
-    // the step we just matched toward (the next step in the right-to-left
-    // walk — i.e. `rest[i+1]`, or `last` when `i` is the last in `rest`).
+    // matching an ancestor/sibling for step `rest[i]`, we consult the
+    // combinator of the step we just matched toward.
     let (last, rest) = chain.split_last()?;
     if !last.selector.matches(tag, id, classes) {
         return None;
@@ -221,6 +226,12 @@ fn match_chain(
     // ancestor: ancestors[..ancestor_i] remain as candidates for the next
     // step up. Start at the end (the element's nearest ancestor).
     let mut ancestor_i = ancestors.len();
+    // `sibling_i` tracks where we are in the preceding-siblings slice
+    // (nearest-last: siblings[siblings.len()-1] is the element's immediate
+    // preceding sibling). Sibling combinators only ever consult the
+    // immediate-or-near preceding siblings and then hand off to ancestor
+    // matching for the next combinator up.
+    let mut sibling_i = siblings.len();
     // Walk rest right-to-left; for each step, the combinator that applies is
     // the one on the *following* (already-matched, rightward) step.
     let mut following_combinator = last.combinator;
@@ -249,6 +260,31 @@ fn match_chain(
                 let (at, aid, acls) = ancestors[ancestor_i];
                 if step.selector.matches(at, aid, acls) {
                     found = true;
+                }
+            }
+            Combinator::AdjacentSibling => {
+                // A + B: B's immediate preceding sibling must be A. The
+                // siblings slice is nearest-last, so siblings[len-1] is the
+                // immediate predecessor. If it doesn't match, fail.
+                if sibling_i == 0 {
+                    return None;
+                }
+                sibling_i -= 1;
+                let (st, sid, scls) = siblings[sibling_i];
+                if step.selector.matches(st, sid, scls) {
+                    found = true;
+                }
+            }
+            Combinator::GeneralSibling => {
+                // A ~ B: some preceding sibling must be A. Walk back through
+                // the earlier siblings until one matches.
+                while sibling_i > 0 {
+                    sibling_i -= 1;
+                    let (st, sid, scls) = siblings[sibling_i];
+                    if step.selector.matches(st, sid, scls) {
+                        found = true;
+                        break;
+                    }
                 }
             }
         }
@@ -331,50 +367,71 @@ fn parse_selector(s: &str) -> Option<Chain> {
     if s.is_empty() {
         return None;
     }
-    // Sibling combinators + universal + pseudo-classes still fail closed.
-    if s.contains(['+', '~', '*', ':']) {
+    // Universal `*` + pseudo-classes `:` still fail closed (need interaction
+    // state / aren't meaningfully matched against tag/id/class today).
+    if s.contains(['*', ':']) {
         return None;
     }
-    // Tokenise: split on whitespace, but keep a standalone `>` as its own
-    // token so `div > p` yields [div, >, p]. Multiple spaces collapse via
-    // split_whitespace already.
+    // Tokenise: split on whitespace, but keep standalone combinators (`>`,
+    // `+`, `~`) as their own tokens so `div > p` yields [div, >, p]. Multiple
+    // spaces collapse via split_whitespace already.
     let tokens: Vec<&str> = s.split_whitespace().collect();
     let mut chain: Chain = Vec::new();
-    let mut pending_child = false; // a `>` is pending; the next compound is a child
+    // The combinator pending for the *next* compound (default Descendant).
+    let mut pending = Combinator::Descendant;
     for tok in tokens {
-        if tok == ">" {
-            pending_child = true;
+        // A standalone combinator token sets the pending combinator.
+        if matches!(tok, ">" | "+" | "~") {
+            pending = match tok {
+                ">" => Combinator::Child,
+                "+" => Combinator::AdjacentSibling,
+                "~" => Combinator::GeneralSibling,
+                _ => unreachable!(),
+            };
             continue;
         }
-        // A compound may itself contain `>` only if it's like `div>p` (no
-        // spaces) — handle that by splitting on `>` too.
-        let mut sub_iter = tok.split('>').peekable();
+        // A compound may contain `>` with no spaces (`div>p`); handle that by
+        // splitting on `>` so each sub gets the Child combinator. (`+`/`~`
+        // without spaces like `div+p` are also handled by the same split.)
+        let mut sub_iter = tok.split(['>', '+', '~']).peekable();
         let mut first_sub = true;
         while let Some(sub) = sub_iter.next() {
             if !first_sub {
-                pending_child = true;
+                // A `>`/`+`/`~` inside the token: pick the combinator by
+                // scanning the original token for which one separates here.
+                // The split consumed one char; find it to know which.
+                pending = if tok.contains('>') {
+                    Combinator::Child
+                } else if tok.contains('+') {
+                    Combinator::AdjacentSibling
+                } else {
+                    Combinator::GeneralSibling
+                };
             }
             if sub.is_empty() {
-                // leading/trailing `>` inside the token (e.g. `div>` or `>p`)
+                // leading/trailing combinator inside the token (e.g. `div>` or `>p`)
                 first_sub = false;
                 continue;
             }
             let sel = parse_compound(sub)?;
-            let combinator = if pending_child {
-                Combinator::Child
-            } else {
-                Combinator::Descendant
-            };
+            // The first compound's combinator is whatever was pending before
+            // it; subsequent compounds in this token carry the inner combinator.
             chain.push(ChainStep {
                 selector: sel,
-                combinator,
+                combinator: pending,
             });
-            pending_child = false;
+            pending = Combinator::Descendant;
             first_sub = false;
-            // If there's another sub after this one (split on `>`), the next
-            // is a child.
+            // If there's another sub after this one (split on a combinator),
+            // the next carries that combinator.
             if sub_iter.peek().is_some() {
-                pending_child = true;
+                pending = if tok.contains('>') {
+                    Combinator::Child
+                } else if tok.contains('+') {
+                    Combinator::AdjacentSibling
+                } else {
+                    Combinator::GeneralSibling
+                };
             }
         }
     }
@@ -518,19 +575,19 @@ mod tests {
         assert_eq!(rules.len(), 3);
         let a = no_ancestors();
         assert!(rules[0]
-            .specificity_if_matches(&a, "div", None, &[])
+            .specificity_if_matches(&a, &[], "div", None, &[])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, "span", None, &[])
+            .specificity_if_matches(&a, &[], "span", None, &[])
             .is_none());
         assert!(rules[1]
-            .specificity_if_matches(&a, "div", None, &["card"])
+            .specificity_if_matches(&a, &[], "div", None, &["card"])
             .is_some());
         assert!(rules[1]
-            .specificity_if_matches(&a, "div", None, &[])
+            .specificity_if_matches(&a, &[], "div", None, &[])
             .is_none());
         assert!(rules[2]
-            .specificity_if_matches(&a, "div", Some("hero"), &[])
+            .specificity_if_matches(&a, &[], "div", Some("hero"), &[])
             .is_some());
     }
 
@@ -540,13 +597,13 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let a = no_ancestors();
         assert!(rules[0]
-            .specificity_if_matches(&a, "div", Some("hero"), &["card"])
+            .specificity_if_matches(&a, &[], "div", Some("hero"), &["card"])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, "div", Some("hero"), &[])
+            .specificity_if_matches(&a, &[], "div", Some("hero"), &[])
             .is_none());
         assert!(rules[0]
-            .specificity_if_matches(&a, "span", Some("hero"), &["card"])
+            .specificity_if_matches(&a, &[], "span", Some("hero"), &["card"])
             .is_none());
     }
 
@@ -556,13 +613,13 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let a = no_ancestors();
         assert!(rules[0]
-            .specificity_if_matches(&a, "h1", None, &[])
+            .specificity_if_matches(&a, &[], "h1", None, &[])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, "h2", None, &[])
+            .specificity_if_matches(&a, &[], "h2", None, &[])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, "h3", None, &[])
+            .specificity_if_matches(&a, &[], "h3", None, &[])
             .is_none());
     }
 
@@ -584,19 +641,19 @@ mod tests {
         let ancestors: Vec<AncestorFrame<'_>> = vec![("div", None, empty)];
         assert!(
             rules[0]
-                .specificity_if_matches(&ancestors, "p", None, &[])
+                .specificity_if_matches(&ancestors, &[], "p", None, &[])
                 .is_some(),
             "div p should match a p descendant of a div"
         );
         // Without a div ancestor: no match.
         let no_ancestors: Vec<AncestorFrame<'_>> = Vec::new();
         assert!(rules[0]
-            .specificity_if_matches(&no_ancestors, "p", None, &[])
+            .specificity_if_matches(&no_ancestors, &[], "p", None, &[])
             .is_none());
         // p without a div ancestor (say inside an article) doesn't match.
         let article: Vec<AncestorFrame<'_>> = vec![("article", None, empty)];
         assert!(rules[0]
-            .specificity_if_matches(&article, "p", None, &[])
+            .specificity_if_matches(&article, &[], "p", None, &[])
             .is_none());
     }
 
@@ -612,7 +669,7 @@ mod tests {
             ("div", None, empty),
         ];
         assert!(rules[0]
-            .specificity_if_matches(&ancestors, "p", None, &[])
+            .specificity_if_matches(&ancestors, &[], "p", None, &[])
             .is_some());
     }
 
@@ -623,12 +680,12 @@ mod tests {
         let empty: &[&str] = &[];
         let good: Vec<AncestorFrame<'_>> = vec![("html", None, empty), ("body", None, empty)];
         assert!(rules[0]
-            .specificity_if_matches(&good, "p", None, &[])
+            .specificity_if_matches(&good, &[], "p", None, &[])
             .is_some());
         // Wrong order (body then html) shouldn't match.
         let reversed: Vec<AncestorFrame<'_>> = vec![("body", None, empty), ("html", None, empty)];
         assert!(rules[0]
-            .specificity_if_matches(&reversed, "p", None, &[])
+            .specificity_if_matches(&reversed, &[], "p", None, &[])
             .is_none());
     }
 
@@ -637,7 +694,7 @@ mod tests {
         let rules = parse_stylesheet(".card p { color: red; }");
         let ancestors: Vec<AncestorFrame<'_>> = vec![("div", None, &["card"])];
         let spec = rules[0]
-            .specificity_if_matches(&ancestors, "p", None, &[])
+            .specificity_if_matches(&ancestors, &[], "p", None, &[])
             .expect("should match");
         // (0, 1, 1): one class from `.card`, one type from `p`.
         assert_eq!(spec, (0, 1, 1));
@@ -652,11 +709,22 @@ mod tests {
 
     #[test]
     fn unsupported_combinator_syntax_still_fails_closed() {
-        // `+`, `~`, `*`, `:` still unsupported — whole rule dropped.
+        // `*` and `:` still unsupported — whole rule dropped. (`+`/`~` are
+        // now supported; see sibling_combinator tests.)
         assert_eq!(parse_stylesheet("a:hover { color: red; }").len(), 0);
-        assert_eq!(parse_stylesheet("div + p { color: red; }").len(), 0);
-        assert_eq!(parse_stylesheet("div ~ p { color: red; }").len(), 0);
         assert_eq!(parse_stylesheet("* { color: red; }").len(), 0);
+    }
+
+    #[test]
+    fn adjacent_sibling_combinator_parses() {
+        // `a + b` (adjacent sibling) now parses.
+        assert_eq!(parse_stylesheet("h1 + p { color: red; }").len(), 1);
+    }
+
+    #[test]
+    fn general_sibling_combinator_parses() {
+        // `a ~ b` (general sibling) now parses.
+        assert_eq!(parse_stylesheet("h1 ~ p { color: red; }").len(), 1);
     }
 
     #[test]
@@ -680,9 +748,9 @@ mod tests {
         // [id] matches an element with an id attribute.
         let chain = parse_selector("[id]").expect("[id] should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, "div", Some("main"), &[]).is_some());
+        assert!(match_chain(&chain, &ancestors, &[], "div", Some("main"), &[]).is_some());
         // No id -> no match.
-        assert!(match_chain(&chain, &ancestors, "div", None, &[]).is_none());
+        assert!(match_chain(&chain, &ancestors, &[], "div", None, &[]).is_none());
     }
 
     #[test]
@@ -694,17 +762,17 @@ mod tests {
         let chain = parse_selector(r#"[class="btn"]"#).expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
         // Element with class "btn" matches.
-        assert!(match_chain(&chain, &ancestors, "a", None, &["btn"]).is_some());
+        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["btn"]).is_some());
         // Different class -> no match.
-        assert!(match_chain(&chain, &ancestors, "a", None, &["nav"]).is_none());
+        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["nav"]).is_none());
     }
 
     #[test]
     fn attribute_selector_class_prefix_matches() {
         let chain = parse_selector(r#"[class^="btn"]"#).expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, "a", None, &["btn-primary"]).is_some());
-        assert!(match_chain(&chain, &ancestors, "a", None, &["nav-link"]).is_none());
+        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["btn-primary"]).is_some());
+        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["nav-link"]).is_none());
     }
 
     #[test]
@@ -712,7 +780,7 @@ mod tests {
         // [data-x] parses but data-x isn't exposed -> no match ever.
         let chain = parse_selector("[data-x]").expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, "div", Some("a"), &["b"]).is_none());
+        assert!(match_chain(&chain, &ancestors, &[], "div", Some("a"), &["b"]).is_none());
     }
 
     #[test]
@@ -720,8 +788,8 @@ mod tests {
         // div.card[id] -- a div with class card and an id.
         let chain = parse_selector("div.card[id]").expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, "div", Some("x"), &["card"]).is_some());
-        assert!(match_chain(&chain, &ancestors, "div", None, &["card"]).is_none());
+        assert!(match_chain(&chain, &ancestors, &[], "div", Some("x"), &["card"]).is_some());
+        assert!(match_chain(&chain, &ancestors, &[], "div", None, &["card"]).is_none());
     }
 
     #[test]
@@ -733,7 +801,7 @@ mod tests {
         // ancestors: [div, section] -> p descendant of section, section child of div.
         let ancestors: Vec<AncestorFrame<'_>> =
             vec![("div", None, empty), ("section", None, empty)];
-        assert!(match_chain(&chain, &ancestors, "p", None, &[]).is_some());
+        assert!(match_chain(&chain, &ancestors, &[], "p", None, &[]).is_some());
         // ancestors: [div, article, section] -> section is NOT a direct child
         // of div (article intervenes) -> no match.
         let ancestors2: Vec<AncestorFrame<'_>> = vec![
@@ -741,6 +809,6 @@ mod tests {
             ("article", None, empty),
             ("section", None, empty),
         ];
-        assert!(match_chain(&chain, &ancestors2, "p", None, &[]).is_none());
+        assert!(match_chain(&chain, &ancestors2, &[], "p", None, &[]).is_none());
     }
 }
