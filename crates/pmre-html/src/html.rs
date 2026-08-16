@@ -23,7 +23,7 @@
 //! font-weight, text-align, text-decoration, align-items, justify-content, opacity.
 //! Colors: #rgb/#rrggbb/#rrggbbaa, rgb()/rgba(), hsl(), ~40 named colors.
 
-use crate::css::{self, Rule};
+use crate::css::{self, InteractionState, Rule};
 use pmre_core::paint::Rgba;
 use pmre_layout::ux::{Align, Dim, Dir, Edges, Justify, Shadow, Span, Style, UxNode};
 use pmre_raster::raster::Image;
@@ -206,6 +206,17 @@ pub fn parse(src: &str) -> UxNode {
 /// dropped, matching the doctrine boundary: the kit does not fetch — it only
 /// renders what it's given.
 pub fn parse_with_images(src: &str, images: &HashMap<String, Arc<Image>>) -> UxNode {
+    parse_with_images_and_interaction(src, images, InteractionState::default())
+}
+
+/// Like [`parse_with_images`] but the caller supplies the interaction state
+/// (which element id is hovered / focused) so `:hover` / `:focus` pseudo-class
+/// rules apply. The browser calls this on re-render after a hover/focus change.
+pub fn parse_with_images_and_interaction(
+    src: &str,
+    images: &HashMap<String, Arc<Image>>,
+    interaction: InteractionState,
+) -> UxNode {
     let toks = tokenize(src);
     let mut pos = 0usize;
     let roots = parse_nodes(&toks, &mut pos, None, 0);
@@ -224,6 +235,7 @@ pub fn parse_with_images(src: &str, images: &HashMap<String, Arc<Image>>) -> UxN
         ParentList::None,
         &mut ancestors,
         &ids,
+        interaction,
     );
     if kids.len() == 1 {
         kids.into_iter().next().unwrap()
@@ -718,6 +730,7 @@ fn matched_rules<'a>(
     sheet: &'a [Rule],
     ancestors: &[AncestorStackFrame],
     siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
@@ -729,7 +742,7 @@ fn matched_rules<'a>(
     let mut matched: Vec<(&Rule, (u32, u32, u32))> = sheet
         .iter()
         .filter_map(|r| {
-            r.specificity_if_matches(&borrowed_a, &borrowed_s, tag, id, classes)
+            r.specificity_if_matches(&borrowed_a, &borrowed_s, interaction, tag, id, classes)
                 .map(|sp| (r, sp))
         })
         .collect();
@@ -767,13 +780,14 @@ fn apply_cascade(
     sheet: &[Rule],
     ancestors: &[AncestorStackFrame],
     siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
     inline_style: Option<&str>,
 ) -> bool {
     let mut hidden = false;
-    for r in matched_rules(sheet, ancestors, siblings, tag, id, classes) {
+    for r in matched_rules(sheet, ancestors, siblings, interaction, tag, id, classes) {
         apply_css(style, inh, &r.declarations);
         if let Some(is_none) = declares_display_none(&r.declarations) {
             hidden = is_none;
@@ -813,6 +827,7 @@ fn children_to_ux(
     parent_list: ParentList,
     ancestors: &mut Vec<AncestorStackFrame>,
     ids: &IdAlloc,
+    interaction: InteractionState,
 ) -> Vec<UxNode> {
     let mut out: Vec<UxNode> = Vec::new();
     let mut run: Vec<Span> = Vec::new();
@@ -882,6 +897,7 @@ fn children_to_ux(
                     &mut run,
                     ancestors,
                     &prev_siblings,
+                    interaction,
                 );
                 // Record this inline element as a preceding sibling for the
                 // next sibling's + / ~ combinators.
@@ -936,6 +952,7 @@ fn children_to_ux(
                     ancestors,
                     ids,
                     &prev_siblings,
+                    interaction,
                 ) {
                     out.push(node);
                     // Record this block element as a preceding sibling for
@@ -983,6 +1000,7 @@ fn inline_spans(
     run: &mut Vec<Span>,
     ancestors: &mut Vec<AncestorStackFrame>,
     siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
 ) {
     let mut inh = inh;
     inh.font_size = tag_font(tag, inh.font_size);
@@ -1006,6 +1024,7 @@ fn inline_spans(
         sheet,
         ancestors,
         siblings,
+        interaction,
         tag,
         id,
         &class_refs,
@@ -1045,6 +1064,7 @@ fn inline_spans(
                     // Nested inline elements have no block-sibling context to
                     // carry here (they coalesce into the same Rich flow).
                     &[],
+                    interaction,
                 )
             }
             _ => {} // block inside inline: out of subset, dropped
@@ -1069,6 +1089,7 @@ fn elem_to_ux(
     ancestors: &mut Vec<AncestorStackFrame>,
     ids: &IdAlloc,
     siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
 ) -> Option<UxNode> {
     // <img>: emit a UxNode::Image if the src is in the pre-fetched map, drop
     // otherwise. This runs *before* `is_dropped(tag)` so an img with a hit
@@ -1111,6 +1132,7 @@ fn elem_to_ux(
             sheet,
             ancestors,
             siblings,
+            interaction,
             tag,
             id,
             &class_refs,
@@ -1134,6 +1156,7 @@ fn elem_to_ux(
                 ParentList::None,
                 ancestors,
                 &child_ids,
+                interaction,
             )
         } else {
             Vec::new()
@@ -1158,6 +1181,7 @@ fn elem_to_ux(
         sheet,
         ancestors,
         siblings,
+        interaction,
         tag,
         id,
         &class_refs,
@@ -1188,6 +1212,7 @@ fn elem_to_ux(
         this_list,
         ancestors,
         ids,
+        interaction,
     );
     ancestors.pop();
     Some(UxNode::Box { style, children })
@@ -1933,6 +1958,56 @@ mod tests {
             1,
             "child combinator should match exactly the direct-child <p>"
         );
+    }
+
+    #[test]
+    fn hover_pseudo_class_applies_when_hovered() {
+        // #btn:hover colours the button red only when it's the hovered id.
+        let doc = r#"<style>#btn:hover { background: #ff0000; }</style>
+            <div id="btn"></div>"#;
+        let interaction = crate::css::InteractionState {
+            hovered_id: Some("btn"),
+            focused_id: None,
+        };
+        let root =
+            parse_with_images_and_interaction(doc, &std::collections::HashMap::new(), interaction);
+        if let UxNode::Box { .. } = &root {
+            // The div#btn is the root (only child collapses up); its background
+            // should be red when hovered. Find the box with a background set.
+            fn find_red_bg(node: &UxNode) -> bool {
+                if let UxNode::Box { style, children } = node {
+                    let self_red = style
+                        .background
+                        .map(|c| c.r > 0.9 && c.g < 0.1 && c.b < 0.1)
+                        .unwrap_or(false);
+                    self_red || children.iter().any(find_red_bg)
+                } else {
+                    false
+                }
+            }
+            assert!(
+                find_red_bg(&root),
+                "hovered #btn should have a red background"
+            );
+        }
+        // Not hovered -> no red background.
+        let root2 = parse_with_images_and_interaction(
+            doc,
+            &std::collections::HashMap::new(),
+            crate::css::InteractionState::default(),
+        );
+        fn find_red_bg2(node: &UxNode) -> bool {
+            if let UxNode::Box { style, children } = node {
+                let self_red = style
+                    .background
+                    .map(|c| c.r > 0.9 && c.g < 0.1 && c.b < 0.1)
+                    .unwrap_or(false);
+                self_red || children.iter().any(find_red_bg2)
+            } else {
+                false
+            }
+        }
+        assert!(!find_red_bg2(&root2), "non-hovered #btn should not be red");
     }
 
     #[test]

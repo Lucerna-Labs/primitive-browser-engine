@@ -43,6 +43,30 @@ pub enum AttrOp {
 
 /// One compound selector: every part must match the same element.
 /// `div.card#hero` → `{ type_name: Some("div"), id: Some("hero"), classes: ["card"] }`.
+/// A pseudo-class constraint on an element (`:hover`, `:focus`). Matched
+/// against the element's interaction state — whether it is the currently
+/// hovered/focused element, supplied to the cascade by the browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Pseudo {
+    /// No pseudo-class (the common case).
+    #[default]
+    None,
+    /// `:hover` — the element is the currently-hovered one.
+    Hover,
+    /// `:focus` — the element is the currently-focused one.
+    Focus,
+}
+
+/// The interaction state the browser supplies to the cascade: the id of the
+/// currently hovered element and the currently focused element (if any). Used
+/// to match `:hover` / `:focus` pseudo-classes. Passed through `match_chain`
+/// alongside the ancestor/sibling slices.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InteractionState {
+    pub hovered_id: Option<&'static str>,
+    pub focused_id: Option<&'static str>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Selector {
     pub type_name: Option<String>,
@@ -51,6 +75,8 @@ pub struct Selector {
     /// Attribute selectors (`[href]`, `[class^="btn"]`, …). Empty for the
     /// common case. Matched against id/class only today (see [`AttrSelector`]).
     pub attrs: Vec<AttrSelector>,
+    /// A pseudo-class (`:hover`, `:focus`) on this compound, if any.
+    pub pseudo: Pseudo,
 }
 
 impl Selector {
@@ -67,7 +93,13 @@ impl Selector {
         )
     }
 
-    fn matches(&self, tag: &str, id: Option<&str>, classes: &[&str]) -> bool {
+    fn matches(
+        &self,
+        tag: &str,
+        id: Option<&str>,
+        classes: &[&str],
+        interaction: InteractionState,
+    ) -> bool {
         if let Some(t) = &self.type_name {
             if t != tag {
                 return false;
@@ -82,7 +114,15 @@ impl Selector {
             return false;
         }
         // Attribute selectors: match against id / class only today.
-        self.attrs.iter().all(|a| a.matches(id, classes))
+        if !self.attrs.iter().all(|a| a.matches(id, classes)) {
+            return false;
+        }
+        // Pseudo-class: the element must be the hovered/focused one.
+        match self.pseudo {
+            Pseudo::None => true,
+            Pseudo::Hover => id.is_some() && interaction.hovered_id == id,
+            Pseudo::Focus => id.is_some() && interaction.focused_id == id,
+        }
     }
 }
 
@@ -185,13 +225,16 @@ impl Rule {
         &self,
         ancestors: &[AncestorFrame<'_>],
         siblings: &[AncestorFrame<'_>],
+        interaction: InteractionState,
         tag: &str,
         id: Option<&str>,
         classes: &[&str],
     ) -> Option<(u32, u32, u32)> {
         self.chains
             .iter()
-            .filter_map(|chain| match_chain(chain, ancestors, siblings, tag, id, classes))
+            .filter_map(|chain| {
+                match_chain(chain, ancestors, siblings, interaction, tag, id, classes)
+            })
             .max()
     }
 }
@@ -209,6 +252,7 @@ fn match_chain(
     chain: &[ChainStep],
     ancestors: &[AncestorFrame<'_>],
     siblings: &[AncestorFrame<'_>],
+    interaction: InteractionState,
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
@@ -219,7 +263,7 @@ fn match_chain(
     // matching an ancestor/sibling for step `rest[i]`, we consult the
     // combinator of the step we just matched toward.
     let (last, rest) = chain.split_last()?;
-    if !last.selector.matches(tag, id, classes) {
+    if !last.selector.matches(tag, id, classes, interaction) {
         return None;
     }
     // `ancestor_i` is the index *after* the most-recently-considered
@@ -243,7 +287,7 @@ fn match_chain(
                 while ancestor_i > 0 {
                     ancestor_i -= 1;
                     let (at, aid, acls) = ancestors[ancestor_i];
-                    if step.selector.matches(at, aid, acls) {
+                    if step.selector.matches(at, aid, acls, interaction) {
                         found = true;
                         break;
                     }
@@ -258,7 +302,7 @@ fn match_chain(
                 }
                 ancestor_i -= 1;
                 let (at, aid, acls) = ancestors[ancestor_i];
-                if step.selector.matches(at, aid, acls) {
+                if step.selector.matches(at, aid, acls, interaction) {
                     found = true;
                 }
             }
@@ -271,7 +315,7 @@ fn match_chain(
                 }
                 sibling_i -= 1;
                 let (st, sid, scls) = siblings[sibling_i];
-                if step.selector.matches(st, sid, scls) {
+                if step.selector.matches(st, sid, scls, interaction) {
                     found = true;
                 }
             }
@@ -281,7 +325,7 @@ fn match_chain(
                 while sibling_i > 0 {
                     sibling_i -= 1;
                     let (st, sid, scls) = siblings[sibling_i];
-                    if step.selector.matches(st, sid, scls) {
+                    if step.selector.matches(st, sid, scls, interaction) {
                         found = true;
                         break;
                     }
@@ -367,9 +411,10 @@ fn parse_selector(s: &str) -> Option<Chain> {
     if s.is_empty() {
         return None;
     }
-    // Universal `*` + pseudo-classes `:` still fail closed (need interaction
-    // state / aren't meaningfully matched against tag/id/class today).
-    if s.contains(['*', ':']) {
+    // Universal `*` still fails closed (matches everything — not useful
+    // against tag/id/class today). Pseudo-classes (`:hover`/`:focus`) are
+    // parsed + matched by parse_compound / Selector::matches.
+    if s.contains('*') {
         return None;
     }
     // Tokenise: split on whitespace, but keep standalone combinators (`>`,
@@ -466,6 +511,27 @@ fn parse_compound(s: &str) -> Option<Selector> {
         sel.attrs.push(attr);
         rest = format!("{}{}", &rest[..open], &rest[close + 1..]);
     }
+
+    // Peel off any `:hover` / `:focus` pseudo-classes. Only these two are
+    // supported; an unknown pseudo-class fails the whole compound closed.
+    while let Some(colon) = rest.find(':') {
+        let after = &rest[colon + 1..];
+        let end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .unwrap_or(after.len());
+        let name = &after[..end];
+        let pseudo = match name {
+            "hover" => Pseudo::Hover,
+            "focus" => Pseudo::Focus,
+            _ => return None, // unsupported pseudo-class -> fail closed
+        };
+        if sel.pseudo != Pseudo::None {
+            return None;
+        }
+        sel.pseudo = pseudo;
+        rest = format!("{}{}", &rest[..colon], &rest[colon + 1 + end..]);
+    }
+
     let mut cur = String::new();
     let mut kind = 'e'; // 'e' = type/tag, '.' = class, '#' = id
     for ch in rest.chars() {
@@ -478,7 +544,11 @@ fn parse_compound(s: &str) -> Option<Selector> {
         }
     }
     set_part(&mut sel, kind, &cur);
-    if sel.type_name.is_none() && sel.id.is_none() && sel.classes.is_empty() && sel.attrs.is_empty()
+    if sel.type_name.is_none()
+        && sel.id.is_none()
+        && sel.classes.is_empty()
+        && sel.attrs.is_empty()
+        && sel.pseudo == Pseudo::None
     {
         None
     } else {
@@ -575,19 +645,26 @@ mod tests {
         assert_eq!(rules.len(), 3);
         let a = no_ancestors();
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "div", None, &[])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "div", None, &[])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "span", None, &[])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "span", None, &[])
             .is_none());
         assert!(rules[1]
-            .specificity_if_matches(&a, &[], "div", None, &["card"])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "div", None, &["card"])
             .is_some());
         assert!(rules[1]
-            .specificity_if_matches(&a, &[], "div", None, &[])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "div", None, &[])
             .is_none());
         assert!(rules[2]
-            .specificity_if_matches(&a, &[], "div", Some("hero"), &[])
+            .specificity_if_matches(
+                &a,
+                &[],
+                InteractionState::default(),
+                "div",
+                Some("hero"),
+                &[]
+            )
             .is_some());
     }
 
@@ -597,13 +674,34 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let a = no_ancestors();
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "div", Some("hero"), &["card"])
+            .specificity_if_matches(
+                &a,
+                &[],
+                InteractionState::default(),
+                "div",
+                Some("hero"),
+                &["card"]
+            )
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "div", Some("hero"), &[])
+            .specificity_if_matches(
+                &a,
+                &[],
+                InteractionState::default(),
+                "div",
+                Some("hero"),
+                &[]
+            )
             .is_none());
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "span", Some("hero"), &["card"])
+            .specificity_if_matches(
+                &a,
+                &[],
+                InteractionState::default(),
+                "span",
+                Some("hero"),
+                &["card"]
+            )
             .is_none());
     }
 
@@ -613,13 +711,13 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let a = no_ancestors();
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "h1", None, &[])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "h1", None, &[])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "h2", None, &[])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "h2", None, &[])
             .is_some());
         assert!(rules[0]
-            .specificity_if_matches(&a, &[], "h3", None, &[])
+            .specificity_if_matches(&a, &[], InteractionState::default(), "h3", None, &[])
             .is_none());
     }
 
@@ -641,19 +739,33 @@ mod tests {
         let ancestors: Vec<AncestorFrame<'_>> = vec![("div", None, empty)];
         assert!(
             rules[0]
-                .specificity_if_matches(&ancestors, &[], "p", None, &[])
+                .specificity_if_matches(
+                    &ancestors,
+                    &[],
+                    InteractionState::default(),
+                    "p",
+                    None,
+                    &[]
+                )
                 .is_some(),
             "div p should match a p descendant of a div"
         );
         // Without a div ancestor: no match.
         let no_ancestors: Vec<AncestorFrame<'_>> = Vec::new();
         assert!(rules[0]
-            .specificity_if_matches(&no_ancestors, &[], "p", None, &[])
+            .specificity_if_matches(
+                &no_ancestors,
+                &[],
+                InteractionState::default(),
+                "p",
+                None,
+                &[]
+            )
             .is_none());
         // p without a div ancestor (say inside an article) doesn't match.
         let article: Vec<AncestorFrame<'_>> = vec![("article", None, empty)];
         assert!(rules[0]
-            .specificity_if_matches(&article, &[], "p", None, &[])
+            .specificity_if_matches(&article, &[], InteractionState::default(), "p", None, &[])
             .is_none());
     }
 
@@ -669,7 +781,7 @@ mod tests {
             ("div", None, empty),
         ];
         assert!(rules[0]
-            .specificity_if_matches(&ancestors, &[], "p", None, &[])
+            .specificity_if_matches(&ancestors, &[], InteractionState::default(), "p", None, &[])
             .is_some());
     }
 
@@ -680,12 +792,12 @@ mod tests {
         let empty: &[&str] = &[];
         let good: Vec<AncestorFrame<'_>> = vec![("html", None, empty), ("body", None, empty)];
         assert!(rules[0]
-            .specificity_if_matches(&good, &[], "p", None, &[])
+            .specificity_if_matches(&good, &[], InteractionState::default(), "p", None, &[])
             .is_some());
         // Wrong order (body then html) shouldn't match.
         let reversed: Vec<AncestorFrame<'_>> = vec![("body", None, empty), ("html", None, empty)];
         assert!(rules[0]
-            .specificity_if_matches(&reversed, &[], "p", None, &[])
+            .specificity_if_matches(&reversed, &[], InteractionState::default(), "p", None, &[])
             .is_none());
     }
 
@@ -694,7 +806,7 @@ mod tests {
         let rules = parse_stylesheet(".card p { color: red; }");
         let ancestors: Vec<AncestorFrame<'_>> = vec![("div", None, &["card"])];
         let spec = rules[0]
-            .specificity_if_matches(&ancestors, &[], "p", None, &[])
+            .specificity_if_matches(&ancestors, &[], InteractionState::default(), "p", None, &[])
             .expect("should match");
         // (0, 1, 1): one class from `.card`, one type from `p`.
         assert_eq!(spec, (0, 1, 1));
@@ -709,10 +821,11 @@ mod tests {
 
     #[test]
     fn unsupported_combinator_syntax_still_fails_closed() {
-        // `*` and `:` still unsupported — whole rule dropped. (`+`/`~` are
-        // now supported; see sibling_combinator tests.)
-        assert_eq!(parse_stylesheet("a:hover { color: red; }").len(), 0);
+        // `*` still unsupported — whole rule dropped. (`:hover`/`:focus` are
+        // now supported; see pseudo-class tests.)
         assert_eq!(parse_stylesheet("* { color: red; }").len(), 0);
+        // :active / :checked etc. still fail closed (unsupported pseudo-classes).
+        assert_eq!(parse_stylesheet("a:active { color: red; }").len(), 0);
     }
 
     #[test]
@@ -748,9 +861,27 @@ mod tests {
         // [id] matches an element with an id attribute.
         let chain = parse_selector("[id]").expect("[id] should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, &[], "div", Some("main"), &[]).is_some());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "div",
+            Some("main"),
+            &[]
+        )
+        .is_some());
         // No id -> no match.
-        assert!(match_chain(&chain, &ancestors, &[], "div", None, &[]).is_none());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "div",
+            None,
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -762,17 +893,53 @@ mod tests {
         let chain = parse_selector(r#"[class="btn"]"#).expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
         // Element with class "btn" matches.
-        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["btn"]).is_some());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "a",
+            None,
+            &["btn"]
+        )
+        .is_some());
         // Different class -> no match.
-        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["nav"]).is_none());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "a",
+            None,
+            &["nav"]
+        )
+        .is_none());
     }
 
     #[test]
     fn attribute_selector_class_prefix_matches() {
         let chain = parse_selector(r#"[class^="btn"]"#).expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["btn-primary"]).is_some());
-        assert!(match_chain(&chain, &ancestors, &[], "a", None, &["nav-link"]).is_none());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "a",
+            None,
+            &["btn-primary"]
+        )
+        .is_some());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "a",
+            None,
+            &["nav-link"]
+        )
+        .is_none());
     }
 
     #[test]
@@ -780,7 +947,121 @@ mod tests {
         // [data-x] parses but data-x isn't exposed -> no match ever.
         let chain = parse_selector("[data-x]").expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, &[], "div", Some("a"), &["b"]).is_none());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "div",
+            Some("a"),
+            &["b"]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hover_matches_only_when_element_is_hovered() {
+        let chain = parse_selector("#btn:hover").expect("should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        // Not hovered -> no match.
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState {
+                hovered_id: None,
+                focused_id: None
+            },
+            "div",
+            Some("btn"),
+            &[]
+        )
+        .is_none());
+        // Hovered -> match.
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState {
+                hovered_id: Some("btn"),
+                focused_id: None
+            },
+            "div",
+            Some("btn"),
+            &[]
+        )
+        .is_some());
+        // A different element hovered -> no match.
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState {
+                hovered_id: Some("other"),
+                focused_id: None
+            },
+            "div",
+            Some("btn"),
+            &[]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn focus_matches_only_when_element_is_focused() {
+        let chain = parse_selector("input:focus").expect("should parse");
+        let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState {
+                hovered_id: None,
+                focused_id: None
+            },
+            "input",
+            None,
+            &[]
+        )
+        .is_none());
+        // :focus needs an id to identify the focused element; an id-less
+        // input can't be the focused one (no stable identity to match on).
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState {
+                hovered_id: None,
+                focused_id: Some("q")
+            },
+            "input",
+            None,
+            &[]
+        )
+        .is_none());
+        // input#q focused -> match.
+        let chain2 = parse_selector("#q:focus").expect("should parse");
+        assert!(match_chain(
+            &chain2,
+            &ancestors,
+            &[],
+            InteractionState {
+                hovered_id: None,
+                focused_id: Some("q")
+            },
+            "input",
+            Some("q"),
+            &[]
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn unsupported_pseudo_class_fails_closed() {
+        // :active, :nth-child, etc. still fail closed.
+        assert!(parse_selector("a:active").is_none());
+        assert!(parse_selector("li:nth-child(2)").is_none());
+        assert!(parse_selector("a:checked").is_none());
     }
 
     #[test]
@@ -788,8 +1069,26 @@ mod tests {
         // div.card[id] -- a div with class card and an id.
         let chain = parse_selector("div.card[id]").expect("should parse");
         let ancestors: Vec<AncestorFrame<'_>> = Vec::new();
-        assert!(match_chain(&chain, &ancestors, &[], "div", Some("x"), &["card"]).is_some());
-        assert!(match_chain(&chain, &ancestors, &[], "div", None, &["card"]).is_none());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "div",
+            Some("x"),
+            &["card"]
+        )
+        .is_some());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "div",
+            None,
+            &["card"]
+        )
+        .is_none());
     }
 
     #[test]
@@ -801,7 +1100,16 @@ mod tests {
         // ancestors: [div, section] -> p descendant of section, section child of div.
         let ancestors: Vec<AncestorFrame<'_>> =
             vec![("div", None, empty), ("section", None, empty)];
-        assert!(match_chain(&chain, &ancestors, &[], "p", None, &[]).is_some());
+        assert!(match_chain(
+            &chain,
+            &ancestors,
+            &[],
+            InteractionState::default(),
+            "p",
+            None,
+            &[]
+        )
+        .is_some());
         // ancestors: [div, article, section] -> section is NOT a direct child
         // of div (article intervenes) -> no match.
         let ancestors2: Vec<AncestorFrame<'_>> = vec![
@@ -809,6 +1117,15 @@ mod tests {
             ("article", None, empty),
             ("section", None, empty),
         ];
-        assert!(match_chain(&chain, &ancestors2, &[], "p", None, &[]).is_none());
+        assert!(match_chain(
+            &chain,
+            &ancestors2,
+            &[],
+            InteractionState::default(),
+            "p",
+            None,
+            &[]
+        )
+        .is_none());
     }
 }
