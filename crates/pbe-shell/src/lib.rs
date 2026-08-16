@@ -10,7 +10,7 @@
 //! chrome (the buttons/input around it) — the two things `pmre-kit` doesn't
 //! have an opinion on.
 
-use pbe_js::{DomHooks, FetchHook, JsRuntime, LogSink};
+use pbe_js::{DomHooks, FetchHook, JsRuntime, LogSink, WsHook};
 use pmre_kit::raster::{decode_bmp, decode_png, Image};
 use pmre_kit::ux::{Align, Dim, Edges, Justify, Style, UxNode};
 use pmre_kit::{Framebuffer, Rgba};
@@ -73,7 +73,7 @@ fn is_network_scheme(address: &str) -> bool {
         || a.starts_with("data:")
 }
 
-fn load(origin: &Origin) -> (String, UxNode) {
+fn load(origin: &Origin) -> (String, UxNode, Option<Box<JsRuntime>>) {
     let (label, html) = match origin {
         Origin::File(path) => {
             let html = std::fs::read_to_string(path)
@@ -103,10 +103,11 @@ fn load(origin: &Origin) -> (String, UxNode) {
     // mutate document.title (reflected in the returned label) and call
     // fetch() through the engine's own protocol layer. Script errors are
     // non-fatal — a failing script logs + continues, like a real browser.
-    let label = run_scripts(&label, &augmented);
+    let (label, js) = run_scripts(&label, &augmented);
     (
         label,
         pmre_kit::html::parse_with_images(&augmented, &images),
+        js,
     )
 }
 
@@ -117,10 +118,10 @@ fn load(origin: &Origin) -> (String, UxNode) {
 /// failures are non-fatal — logged to stderr, never aborting the page load
 /// (matching real-browser behaviour). External `<script src=...>` is a future
 /// extension; today only inline scripts run.
-fn run_scripts(label: &str, html: &str) -> String {
+fn run_scripts(label: &str, html: &str) -> (String, Option<Box<JsRuntime>>) {
     let scripts = find_scripts(html);
     if scripts.is_empty() {
-        return label.to_string();
+        return (label.to_string(), None);
     }
     let title: Rc<RefCell<String>> = Rc::new(RefCell::new(label.to_string()));
     let log: Rc<RefCell<dyn LogSink>> = Rc::new(RefCell::new(StderrLog));
@@ -128,7 +129,8 @@ fn run_scripts(label: &str, html: &str) -> String {
         title: title.clone(),
     }));
     let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(ProtoFetch));
-    let mut rt = JsRuntime::with_bindings(log, dom, fetch);
+    let ws: Rc<RefCell<dyn WsHook>> = Rc::new(RefCell::new(BrowserWs));
+    let mut rt = JsRuntime::with_bindings(log, dom, fetch, ws);
     for block in &scripts {
         // External <script src="...">: fetch (URL via the protocol layer, local
         // path via std::fs), then run the fetched text. Inline <script>: run
@@ -150,7 +152,22 @@ fn run_scripts(label: &str, html: &str) -> String {
         }
     }
     let final_title = title.borrow().clone();
-    final_title
+    (final_title, Some(Box::new(rt)))
+}
+
+struct BrowserWs;
+impl WsHook for BrowserWs {
+    fn open(&mut self, url: &str) -> bool {
+        WS_REQUEST.with(|c| *c.borrow_mut() = Some(url.to_string()));
+        true
+    }
+    fn send(&mut self, _msg: &str) -> bool {
+        false
+    }
+}
+
+thread_local! {
+    static WS_REQUEST: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Fetch external script text over the same on-ramps stylesheets use:
@@ -534,6 +551,9 @@ pub struct Browser {
     ws_inbox: Vec<String>,
     /// The live WebSocket connection, if one is open.
     ws: Option<pbe_proto_ws::WsConnection>,
+    /// The JS runtime the page's <script> ran in, so received WebSocket
+    /// messages can be dispatched to the page's `onmessage` callback.
+    js: Option<Box<JsRuntime>>,
 }
 
 impl Browser {
@@ -550,7 +570,7 @@ impl Browser {
     }
 
     fn from_origin(origin: Origin, width: u32, height: u32) -> Self {
-        let (label, page_root) = load(&origin);
+        let (label, page_root, js) = load(&origin);
         let mut ui = UiState::new(width, height);
         ui.inputs.insert(ADDRESS_INPUT, label.clone());
         Self {
@@ -561,6 +581,7 @@ impl Browser {
             ui,
             ws_inbox: Vec::new(),
             ws: None,
+            js,
         }
     }
 
@@ -634,8 +655,12 @@ impl Browser {
             match conn.recv() {
                 Ok(Some((opcode, payload))) => match opcode {
                     pbe_proto_ws::Opcode::Text => {
-                        self.ws_inbox
-                            .push(String::from_utf8_lossy(&payload).to_string());
+                        let msg = String::from_utf8_lossy(&payload).to_string();
+                        self.ws_inbox.push(msg.clone());
+                        // Dispatch to the page's JS `onmessage` callback.
+                        if let Some(rt) = self.js.as_deref_mut() {
+                            rt.dispatch_ws_message(&msg);
+                        }
                     }
                     pbe_proto_ws::Opcode::Binary => {
                         let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
@@ -676,11 +701,19 @@ impl Browser {
     }
 
     fn load_current(&mut self) {
-        let (label, root) = load(&self.history[self.history_pos]);
+        let (label, root, js) = load(&self.history[self.history_pos]);
         self.label = label;
         self.page_root = root;
         self.ui.scrolls.remove(&PAGE_SCROLL);
         self.ui.inputs.insert(ADDRESS_INPUT, self.label.clone());
+        self.js = js;
+        // If the page's <script> asked to open a WebSocket (WebSocket.open in
+        // JS), open it now that the Browser is built.
+        WS_REQUEST.with(|c| {
+            if let Some(url) = c.borrow_mut().take() {
+                let _ = self.open_websocket(&url);
+            }
+        });
     }
 
     /// Feed one UI event through the chrome + page tree, then apply any

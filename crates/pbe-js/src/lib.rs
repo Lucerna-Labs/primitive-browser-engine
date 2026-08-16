@@ -50,6 +50,24 @@ thread_local! {
     /// The body of the most recent `fetch()` call, so `r.text()` can return
     /// it without capturing a non-Copy JsString in a from_copy_closure.
     static LAST_BODY: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The JS callback registered via `WebSocket.onmessage(fn)`, if any.
+    /// The browser's poll loop calls it via [`JsRuntime::dispatch_ws_message`]
+    /// when a server-pushed message arrives.
+    static WS_CALLBACK: RefCell<Option<boa_engine::object::JsObject>> = const { RefCell::new(None) };
+    /// The browser's WsHook, stashed so the WebSocket.open/send Copy closures
+    /// can reach it.
+    static WS_OPEN: RefCell<Option<Rc<RefCell<dyn WsHook>>>> = const { RefCell::new(None) };
+}
+
+/// Hook the browser supplies so JS `WebSocket.open(url)` reaches the engine's
+/// own WebSocket layer (pbe-proto-ws). The browser owns the connection and
+/// polls it; received messages are delivered back to JS via
+/// [`JsRuntime::dispatch_ws_message`].
+pub trait WsHook {
+    /// Open a ws/wss connection. Returns true on success.
+    fn open(&mut self, url: &str) -> bool;
+    /// Send a text message over the open connection.
+    fn send(&mut self, msg: &str) -> bool;
 }
 
 /// Where `console.log`/`console.error` output goes. The browser supplies
@@ -107,6 +125,7 @@ impl JsRuntime {
         log: Rc<RefCell<dyn LogSink>>,
         dom: Rc<RefCell<dyn DomHooks>>,
         fetch: Rc<RefCell<dyn FetchHook>>,
+        ws: Rc<RefCell<dyn WsHook>>,
     ) -> Self {
         LOG.with(|c| *c.borrow_mut() = Some(log));
         DOM.with(|c| *c.borrow_mut() = Some(dom));
@@ -115,6 +134,7 @@ impl JsRuntime {
         install_console(&mut ctx);
         install_document(&mut ctx);
         install_fetch(&mut ctx);
+        install_websocket(&mut ctx, ws);
         JsRuntime { ctx }
     }
 
@@ -129,6 +149,20 @@ impl JsRuntime {
                 Err(msg)
             }
         }
+    }
+
+    /// Deliver a WebSocket message to the JS `onmessage` callback the page
+    /// registered via `WebSocket.onmessage(fn)`. The browser's poll loop
+    /// calls this for each message it drains from the open connection. If no
+    /// callback is registered, the message is dropped (matching a page that
+    /// never set `onmessage`).
+    pub fn dispatch_ws_message(&mut self, msg: &str) {
+        WS_CALLBACK.with(|c| {
+            if let Some(cb) = c.borrow().clone() {
+                let val = JsValue::from(boa_engine::JsString::from(msg));
+                let _ = cb.call(&JsValue::undefined(), &[val], &mut self.ctx);
+            }
+        });
     }
 }
 
@@ -239,6 +273,58 @@ fn install_fetch(ctx: &mut Context) {
     let _ = ctx.register_global_property(js_string!("fetch"), fetch_callable, Attribute::all());
 }
 
+/// Install a `WebSocket` global: `open(url)` opens a connection via the
+/// browser's WsHook, `send(msg)` sends text, and `onmessage(fn)` registers the
+/// callback [`JsRuntime::dispatch_ws_message`] invokes for each received
+/// message.
+fn install_websocket(ctx: &mut Context, ws: Rc<RefCell<dyn WsHook>>) {
+    // onmessage(fn): store the JS callback in WS_CALLBACK.
+    let onmessage_fn = NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        if let Some(f) = args.get_or_undefined(0).as_object() {
+            WS_CALLBACK.with(|c| *c.borrow_mut() = Some(f.clone()));
+        }
+        Ok(JsValue::undefined())
+    });
+    // open(url): ask the browser's WsHook to open the connection.
+    let open_fn = NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let url = args
+            .get_or_undefined(0)
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default();
+        let ok = WS_OPEN.with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|w| w.borrow_mut().open(&url))
+                .unwrap_or(false)
+        });
+        Ok(JsValue::from(ok))
+    });
+    // send(msg): send text over the open connection.
+    let send_fn = NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let msg = args
+            .get_or_undefined(0)
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default();
+        let ok = WS_OPEN.with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|w| w.borrow_mut().send(&msg))
+                .unwrap_or(false)
+        });
+        Ok(JsValue::from(ok))
+    });
+    // Stash the ws hook in a thread_local the open/send closures read from.
+    WS_OPEN.with(|c| *c.borrow_mut() = Some(ws));
+    let ws_obj = ObjectInitializer::new(ctx)
+        .function(open_fn, js_string!("open"), 1)
+        .function(send_fn, js_string!("send"), 1)
+        .function(onmessage_fn, js_string!("onmessage"), 1)
+        .build();
+    let _ = ctx.register_global_property(js_string!("WebSocket"), ws_obj, Attribute::all());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +384,16 @@ mod tests {
         }
     }
 
+    struct FakeWs;
+    impl crate::WsHook for FakeWs {
+        fn open(&mut self, _url: &str) -> bool {
+            true
+        }
+        fn send(&mut self, _msg: &str) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn console_log_routes_to_sink() {
         let captured = Rc::new(RefCell::new(Vec::new()));
@@ -306,7 +402,7 @@ mod tests {
             title: String::new(),
         }));
         let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(FakeFetch));
-        let mut rt = JsRuntime::with_bindings(log, dom, fetch);
+        let mut rt = JsRuntime::with_bindings(log, dom, fetch, Rc::new(RefCell::new(FakeWs)));
         let _ = rt.run("console.log('a', 'b', 3)");
         assert!(
             captured
@@ -327,11 +423,29 @@ mod tests {
         }));
         let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(FakeFetch));
         let dom_check = dom.clone();
-        let mut rt = JsRuntime::with_bindings(log, dom, fetch);
+        let mut rt = JsRuntime::with_bindings(log, dom, fetch, Rc::new(RefCell::new(FakeWs)));
         let _ = rt.run("document.setTitle('changed')");
         assert_eq!(dom_check.borrow().get_title(), "changed");
         let got = rt.run("document.getTitle()").unwrap();
         assert!(got.contains("changed"), "got = {got}");
+    }
+
+    #[test]
+    fn ws_message_dispatched_to_onmessage_callback() {
+        let log: Rc<RefCell<dyn LogSink>> = Rc::new(RefCell::new(NullLogSink));
+        let dom: Rc<RefCell<dyn DomHooks>> = Rc::new(RefCell::new(FakeDom {
+            title: String::new(),
+        }));
+        let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(FakeFetch));
+        let ws: Rc<RefCell<dyn crate::WsHook>> = Rc::new(RefCell::new(FakeWs));
+        let mut rt = JsRuntime::with_bindings(log, dom, fetch, ws);
+        // Register an onmessage callback that mutates a captured title via
+        // the dom hook.
+        let _ = rt.run("WebSocket.onmessage(function(m) { document.setTitle('got:' + m); })");
+        // Deliver a message; the callback should run and set the title.
+        rt.dispatch_ws_message("hello");
+        let title = rt.run("document.getTitle()").unwrap();
+        assert!(title.contains("got:hello"), "title was {title}");
     }
 
     #[test]
@@ -341,7 +455,7 @@ mod tests {
             title: String::new(),
         }));
         let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(FakeFetch));
-        let mut rt = JsRuntime::with_bindings(log, dom, fetch);
+        let mut rt = JsRuntime::with_bindings(log, dom, fetch, Rc::new(RefCell::new(FakeWs)));
         // fetch() returns an object with .status and .text().
         let r = rt
             .run("fetch('https://x').status")
