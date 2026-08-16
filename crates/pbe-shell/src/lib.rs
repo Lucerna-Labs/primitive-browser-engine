@@ -118,7 +118,7 @@ fn load(origin: &Origin) -> (String, UxNode) {
 /// (matching real-browser behaviour). External `<script src=...>` is a future
 /// extension; today only inline scripts run.
 fn run_scripts(label: &str, html: &str) -> String {
-    let scripts = find_inline_scripts(html);
+    let scripts = find_scripts(html);
     if scripts.is_empty() {
         return label.to_string();
     }
@@ -129,8 +129,23 @@ fn run_scripts(label: &str, html: &str) -> String {
     }));
     let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(ProtoFetch));
     let mut rt = JsRuntime::with_bindings(log, dom, fetch);
-    for src in &scripts {
-        if let Err(e) = rt.run(src) {
+    for block in &scripts {
+        // External <script src="...">: fetch (URL via the protocol layer, local
+        // path via std::fs), then run the fetched text. Inline <script>: run
+        // the body directly. Per-script failures are non-fatal.
+        let code = if let Some(src) = &block.src {
+            let resolved = resolve_href(label, src);
+            match fetch_script_text(&resolved) {
+                Some(text) => text,
+                None => {
+                    eprintln!("script fetch failed: {resolved}");
+                    continue;
+                }
+            }
+        } else {
+            block.body.clone()
+        };
+        if let Err(e) = rt.run(&code) {
             eprintln!("script error: {e}");
         }
     }
@@ -138,12 +153,29 @@ fn run_scripts(label: &str, html: &str) -> String {
     final_title
 }
 
-/// Extract the content of each `<script>...</script>` block in source order.
-/// Tolerant of attribute-bearing `<script type="...">` opening tags and
-/// unclosed scripts. The kit's HTML reducer skips `<script>` content during
-/// parse (it never reaches the render tree); this composition runs it
-/// separately before parse so page logic can execute.
-fn find_inline_scripts(html: &str) -> Vec<String> {
+/// Fetch external script text over the same on-ramps stylesheets use:
+/// `pbe_net::fetch` for URLs, `std::fs` for local paths. Returns `None` on
+/// any failure (the caller treats a missing script as non-fatal, like a real
+/// browser).
+fn fetch_script_text(target: &str) -> Option<String> {
+    if is_network_scheme(target) {
+        pbe_net::fetch(target).ok().map(|p| p.body)
+    } else {
+        std::fs::read_to_string(target).ok()
+    }
+}
+
+/// One `<script>` block: either an external `src` (fetched + run) or inline
+/// body text (run directly). Both arrive in source order.
+struct ScriptBlock {
+    src: Option<String>,
+    body: String,
+}
+
+/// Extract each `<script ...>...</script>` block in source order. Captures the
+/// `src="..."` attribute when present (external script) and the inline body
+/// otherwise. Tolerant of attribute-bearing opening tags and unclosed scripts.
+fn find_scripts(html: &str) -> Vec<ScriptBlock> {
     let lower = html.to_ascii_lowercase();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -152,16 +184,25 @@ fn find_inline_scripts(html: &str) -> Vec<String> {
         let Some(close_rel) = lower[tag_start..].find('>') else {
             break;
         };
-        let body_start = tag_start + close_rel + 1;
-        // Find the matching </script>.
-        let Some(end_rel) = lower[body_start..].find("</script>") else {
-            // Unclosed script: take the rest as script content (lenient).
-            out.push(html[body_start..].to_string());
-            break;
+        let tag_end = tag_start + close_rel; // index of '>'
+        let tag_slice = &html[tag_start..tag_end];
+        let src = attr_value(tag_slice, "src");
+        let body_start = tag_end + 1;
+        let body = match lower[body_start..].find("</script>") {
+            Some(end_rel) => {
+                let body_end = body_start + end_rel;
+                let b = html[body_start..body_end].to_string();
+                i = body_end + "</script>".len();
+                b
+            }
+            None => {
+                // Unclosed script: take the rest as body (lenient).
+                let b = html[body_start..].to_string();
+                i = html.len();
+                b
+            }
         };
-        let body_end = body_start + end_rel;
-        out.push(html[body_start..body_end].to_string());
-        i = body_end + "</script>".len();
+        out.push(ScriptBlock { src, body });
     }
     out
 }
@@ -1238,6 +1279,21 @@ mod script_tests {
         );
         // Label isn't "from-js" (no setTitle ran), and the page loaded.
         assert_ne!(b.label(), "from-js");
+    }
+
+    #[test]
+    fn external_script_src_is_fetched_and_run() {
+        // Write an external .js file that sets the title, reference it from
+        // <script src=>, and confirm the browser runs the fetched code.
+        let dir = std::env::temp_dir();
+        let js_path = dir.join(format!("pbe_ext_script_{}.js", std::process::id()));
+        std::fs::write(&js_path, "document.setTitle('from-external')").unwrap();
+        let html = format!(r#"<script src="{}"></script><p>hi</p>"#, js_path.display());
+        let b = Browser::open_html(&html, 100, 100);
+        // about:blank is the base label for an Html origin; the external
+        // script's resolved src is the absolute file path, which fetches.
+        assert_eq!(b.label(), "from-external");
+        let _ = std::fs::remove_file(&js_path);
     }
 
     #[test]
