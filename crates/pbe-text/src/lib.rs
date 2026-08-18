@@ -246,23 +246,38 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    // Vendored public-domain Tuffy (see cap-text-shape/tests/fonts) keeps these
-    // measurement tests deterministic on every host. cosmic-text panics with
-    // "no default font found" when its FontSystem is empty, which is the case
-    // in a fresh CI container; the headless engine + add_font avoids that and
-    // removes the old `cfg!(windows)` guards.
-    const TUFFY_TTF: &[u8] = include_bytes!("../../cap-text-shape/tests/fonts/Tuffy.ttf");
-    const TUFFY_FAMILY: &str = "Tuffy";
+    // The vendored DejaVu Sans family (see cap-text-shape/tests/fonts/dejavu)
+    // keeps these measurement tests deterministic on every host. cosmic-text
+    // panics with "no default font found" when its FontSystem is empty, which
+    // is the case in a fresh CI container; the headless engine + add_font
+    // avoids that and removes the old `cfg!(windows)` guards. Loading the full
+    // weight+style axis also lets the bold/italic styles resolve real faces.
+    const DEJAVU_SANS: &[u8] =
+        include_bytes!("../../cap-text-shape/tests/fonts/dejavu/DejaVuSans.ttf");
+    const DEJAVU_SANS_BOLD: &[u8] =
+        include_bytes!("../../cap-text-shape/tests/fonts/dejavu/DejaVuSans-Bold.ttf");
+    const DEJAVU_SANS_OBLIQUE: &[u8] =
+        include_bytes!("../../cap-text-shape/tests/fonts/dejavu/DejaVuSans-Oblique.ttf");
+    const DEJAVU_SANS_BOLD_OBLIQUE: &[u8] =
+        include_bytes!("../../cap-text-shape/tests/fonts/dejavu/DejaVuSans-BoldOblique.ttf");
+    const DEJAVU_FAMILY: &str = "DejaVu Sans";
 
     fn test_engine() -> TextEngine {
         let e = TextEngine::new_without_system_fonts();
-        e.add_font(Arc::new(TUFFY_TTF.to_vec()));
+        for bytes in [
+            DEJAVU_SANS,
+            DEJAVU_SANS_BOLD,
+            DEJAVU_SANS_OBLIQUE,
+            DEJAVU_SANS_BOLD_OBLIQUE,
+        ] {
+            e.add_font(Arc::new(bytes.to_vec()));
+        }
         e
     }
 
-    fn tuffy_style() -> TextStyle<'static> {
+    fn dejavu_style() -> TextStyle<'static> {
         TextStyle {
-            family: TUFFY_FAMILY,
+            family: DEJAVU_FAMILY,
             size: 16.0,
             bold: false,
             italic: false,
@@ -272,7 +287,7 @@ mod tests {
     #[test]
     fn measure_is_monotonic_in_length() {
         let e = test_engine();
-        let s = tuffy_style();
+        let s = dejavu_style();
         // A longer string measures strictly wider with a real font.
         let short = e.measure("hi", s);
         let long = e.measure("hello world, this is much longer", s);
@@ -285,7 +300,7 @@ mod tests {
     #[test]
     fn wrap_produces_multiple_lines_for_a_narrow_width() {
         let e = test_engine();
-        let s = tuffy_style();
+        let s = dejavu_style();
         let text = "the quick brown fox jumps over the lazy dog again and again";
         let lines = e.wrap(text, 120.0, s);
         assert!(lines.len() > 1, "narrow width should wrap, got {lines:?}");
@@ -303,7 +318,7 @@ mod tests {
     #[test]
     fn unconstrained_width_is_one_line() {
         let e = test_engine();
-        let s = tuffy_style();
+        let s = dejavu_style();
         assert_eq!(e.wrap("a b c", 0.0, s), vec!["a b c".to_string()]);
     }
 
@@ -313,11 +328,20 @@ mod tests {
         // `TextEngine` on the same input — otherwise layout's line count would
         // diverge from render's line count. The shared engine is created lazily
         // as a *system*-font engine; before measuring we seed it with the same
-        // vendored Tuffy face via the public `with_shaper` hook so the
+        // vendored DejaVu Sans faces via the public `with_shaper` hook so the
         // comparison is like-for-like and never depends on the host having
         // fonts installed.
-        super::with_shaper(|shaper| shaper.add_font(Arc::new(TUFFY_TTF.to_vec())));
-        let s = tuffy_style();
+        super::with_shaper(|shaper| {
+            for bytes in [
+                DEJAVU_SANS,
+                DEJAVU_SANS_BOLD,
+                DEJAVU_SANS_OBLIQUE,
+                DEJAVU_SANS_BOLD_OBLIQUE,
+            ] {
+                shaper.add_font(Arc::new(bytes.to_vec()));
+            }
+        });
+        let s = dejavu_style();
         let text = "wrap this at a narrow width to force multiple lines here";
         let owned = test_engine().wrap(text, 100.0, s);
         let shared = super::wrap(text, 100.0, s);

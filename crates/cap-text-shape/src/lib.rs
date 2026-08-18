@@ -516,20 +516,37 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    // Tuffy is a public-domain TrueType font (Thatcher Ulrich et al., see
-    // tests/fonts/Tuffy-LICENSE.txt) vendored here so the shaping tests are
+    // The DejaVu font family (Bitstream Vera-derived; see
+    // tests/fonts/dejavu/LICENSE) is vendored here so the shaping tests are
     // deterministic and never depend on the host having system fonts
     // installed. cosmic-text panics with "no default font found" inside
     // ShapeLine when its FontSystem has zero registered faces, which is
     // exactly what a fresh CI / sandbox container provides.
     // `new_without_system_fonts()` + `add_font()` is the documented path for
     // this; see the headless constructor's rustdoc above.
-    const TUFFY_TTF: &[u8] = include_bytes!("../tests/fonts/Tuffy.ttf");
-    const TUFFY_FAMILY: &str = "Tuffy";
+    //
+    // DejaVu Sans ships a full weight+style axis (Regular / Bold / Oblique /
+    // BoldOblique), so the cache-keying test gets distinct real faces for its
+    // Normal-vs-Bold and Normal-vs-Italic comparisons rather than a single
+    // face matched for every weight.
+    const DEJAVU_SANS: &[u8] = include_bytes!("../tests/fonts/dejavu/DejaVuSans.ttf");
+    const DEJAVU_SANS_BOLD: &[u8] = include_bytes!("../tests/fonts/dejavu/DejaVuSans-Bold.ttf");
+    const DEJAVU_SANS_OBLIQUE: &[u8] =
+        include_bytes!("../tests/fonts/dejavu/DejaVuSans-Oblique.ttf");
+    const DEJAVU_SANS_BOLD_OBLIQUE: &[u8] =
+        include_bytes!("../tests/fonts/dejavu/DejaVuSans-BoldOblique.ttf");
+    const DEJAVU_FAMILY: &str = "DejaVu Sans";
 
     fn test_shaper() -> CosmicShaper {
         let mut shaper = CosmicShaper::new_without_system_fonts();
-        shaper.add_font(Arc::new(TUFFY_TTF.to_vec()));
+        for bytes in [
+            DEJAVU_SANS,
+            DEJAVU_SANS_BOLD,
+            DEJAVU_SANS_OBLIQUE,
+            DEJAVU_SANS_BOLD_OBLIQUE,
+        ] {
+            shaper.add_font(Arc::new(bytes.to_vec()));
+        }
         shaper
     }
 
@@ -549,7 +566,7 @@ mod tests {
         let _ = CosmicShaper::new_without_system_fonts();
     }
 
-    /// Shape a simple ASCII string against the vendored Tuffy face.
+    /// Shape a simple ASCII string against the vendored DejaVu Sans face.
     /// Uses the headless shaper so the result is identical on every
     /// host (CI container or desktop). "hi" shapes to exactly two
     /// glyphs; the total advance equals the sum of glyph advances.
@@ -559,7 +576,7 @@ mod tests {
         let line = shaper.shape(ShapeRequest {
             text: "hi",
             font: FontDescriptor {
-                family: TUFFY_FAMILY,
+                family: DEJAVU_FAMILY,
                 weight: FontWeight::Normal,
                 style: FontStyle::Normal,
             },
@@ -572,8 +589,8 @@ mod tests {
             .map(|g| g.x_advance.0)
             .sum();
         assert!((total - line.width.0).abs() < 0.001);
-        // "hi" is two code points, both present in Tuffy -> two glyphs,
-        // one run (single font, no fallback needed).
+        // "hi" is two code points, both present in DejaVu Sans -> two
+        // glyphs, one run (single font, no fallback needed).
         let glyphs: Vec<_> = line.runs.iter().flat_map(|r| r.glyphs.iter()).collect();
         assert_eq!(glyphs.len(), 2, "expected exactly two shaped glyphs");
         assert!(!line.runs.is_empty(), "expected at least one shaped run");
@@ -633,7 +650,7 @@ mod tests {
         let request = || ShapeRequest {
             text: "hi",
             font: FontDescriptor {
-                family: TUFFY_FAMILY,
+                family: DEJAVU_FAMILY,
                 weight: FontWeight::Normal,
                 style: FontStyle::Normal,
             },
@@ -659,7 +676,7 @@ mod tests {
             ShapeRequest {
                 text: "a",
                 font: FontDescriptor {
-                    family: TUFFY_FAMILY,
+                    family: DEJAVU_FAMILY,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
@@ -671,7 +688,7 @@ mod tests {
             ShapeRequest {
                 text: "b", // different text
                 font: FontDescriptor {
-                    family: TUFFY_FAMILY,
+                    family: DEJAVU_FAMILY,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
@@ -683,7 +700,7 @@ mod tests {
             ShapeRequest {
                 text: "a",
                 font: FontDescriptor {
-                    family: TUFFY_FAMILY,
+                    family: DEJAVU_FAMILY,
                     weight: FontWeight::Bold, // different weight
                     style: FontStyle::Normal,
                 },
@@ -695,14 +712,26 @@ mod tests {
             ShapeRequest {
                 text: "a",
                 font: FontDescriptor {
-                    family: TUFFY_FAMILY,
+                    family: DEJAVU_FAMILY,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
                 size: Pixels(18.0), // different size
             },
         );
-        assert_eq!(cache.len(), 4);
+        cache.get_or_shape(
+            &mut shaper,
+            ShapeRequest {
+                text: "a",
+                font: FontDescriptor {
+                    family: DEJAVU_FAMILY,
+                    weight: FontWeight::Normal,
+                    style: FontStyle::Italic, // different style (DejaVu Oblique)
+                },
+                size: Pixels(14.0),
+            },
+        );
+        assert_eq!(cache.len(), 5);
     }
 
     /// Cache evicts oldest entries past capacity.
@@ -717,7 +746,7 @@ mod tests {
                 ShapeRequest {
                     text: &s,
                     font: FontDescriptor {
-                        family: TUFFY_FAMILY,
+                        family: DEJAVU_FAMILY,
                         weight: FontWeight::Normal,
                         style: FontStyle::Normal,
                     },
@@ -739,7 +768,7 @@ mod tests {
             ShapeRequest {
                 text: "anything",
                 font: FontDescriptor {
-                    family: TUFFY_FAMILY,
+                    family: DEJAVU_FAMILY,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
