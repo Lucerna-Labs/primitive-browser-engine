@@ -18,6 +18,7 @@
 //! bus's parallel-strand model — not a leak.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use cap_geometry::Pixels;
 use cap_text_shape::{
@@ -102,6 +103,24 @@ impl TextEngine {
             shaper: RefCell::new(CosmicShaper::new()),
             cache: RefCell::new(ShapeCache::new()),
         }
+    }
+
+    /// Build an engine with **no** system fonts. Useful for deterministic
+    /// tests and locked-down / headless environments (e.g. a CI container
+    /// with no installed fonts). Register faces with [`Self::add_font`]
+    /// before measuring; cosmic-text panics on an empty font DB.
+    pub fn new_without_system_fonts() -> Self {
+        Self {
+            shaper: RefCell::new(CosmicShaper::new_without_system_fonts()),
+            cache: RefCell::new(ShapeCache::new()),
+        }
+    }
+
+    /// Register a font from raw bytes (TTF / OTF). Mirrors
+    /// [`CosmicShaper::add_font`]; shaping requests whose `family` matches
+    /// the loaded face resolve to it.
+    pub fn add_font(&self, bytes: Arc<Vec<u8>>) {
+        self.shaper.borrow_mut().add_font(bytes);
     }
 
     /// Real measured width of one line of text, via the shaper (sum of glyph
@@ -225,61 +244,66 @@ pub fn with_shaper<R>(f: impl FnOnce(&mut CosmicShaper) -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
-    #[test]
-    fn measure_is_monotonic_in_length() {
-        let e = TextEngine::new();
-        let s = TextStyle {
-            family: "sans-serif",
+    // Vendored public-domain Tuffy (see cap-text-shape/tests/fonts) keeps these
+    // measurement tests deterministic on every host. cosmic-text panics with
+    // "no default font found" when its FontSystem is empty, which is the case
+    // in a fresh CI container; the headless engine + add_font avoids that and
+    // removes the old `cfg!(windows)` guards.
+    const TUFFY_TTF: &[u8] = include_bytes!("../../cap-text-shape/tests/fonts/Tuffy.ttf");
+    const TUFFY_FAMILY: &str = "Tuffy";
+
+    fn test_engine() -> TextEngine {
+        let e = TextEngine::new_without_system_fonts();
+        e.add_font(Arc::new(TUFFY_TTF.to_vec()));
+        e
+    }
+
+    fn tuffy_style() -> TextStyle<'static> {
+        TextStyle {
+            family: TUFFY_FAMILY,
             size: 16.0,
             bold: false,
             italic: false,
-        };
-        // A longer string measures at least as wide (with any real font).
-        let short = e.measure("hi", s);
-        let long = e.measure("hello world, this is much longer", s);
-        if cfg!(windows) {
-            assert!(
-                long > short,
-                "longer text should be wider: {short} vs {long}"
-            );
         }
     }
 
     #[test]
+    fn measure_is_monotonic_in_length() {
+        let e = test_engine();
+        let s = tuffy_style();
+        // A longer string measures strictly wider with a real font.
+        let short = e.measure("hi", s);
+        let long = e.measure("hello world, this is much longer", s);
+        assert!(
+            long > short,
+            "longer text should be wider: {short} vs {long}"
+        );
+    }
+
+    #[test]
     fn wrap_produces_multiple_lines_for_a_narrow_width() {
-        let e = TextEngine::new();
-        let s = TextStyle {
-            family: "sans-serif",
-            size: 16.0,
-            bold: false,
-            italic: false,
-        };
+        let e = test_engine();
+        let s = tuffy_style();
         let text = "the quick brown fox jumps over the lazy dog again and again";
         let lines = e.wrap(text, 120.0, s);
-        if cfg!(windows) {
-            assert!(lines.len() > 1, "narrow width should wrap, got {lines:?}");
-            // No line should exceed the max width (single long words excepted).
-            for line in &lines {
-                if line.contains(' ') {
-                    assert!(
-                        e.measure(line, s) <= 120.0 + s.size, // small slack
-                        "line too wide: {line:?}"
-                    );
-                }
+        assert!(lines.len() > 1, "narrow width should wrap, got {lines:?}");
+        // No line should exceed the max width (single long words excepted).
+        for line in &lines {
+            if line.contains(' ') {
+                assert!(
+                    e.measure(line, s) <= 120.0 + s.size, // small slack
+                    "line too wide: {line:?}"
+                );
             }
         }
     }
 
     #[test]
     fn unconstrained_width_is_one_line() {
-        let e = TextEngine::new();
-        let s = TextStyle {
-            family: "sans-serif",
-            size: 16.0,
-            bold: false,
-            italic: false,
-        };
+        let e = test_engine();
+        let s = tuffy_style();
         assert_eq!(e.wrap("a b c", 0.0, s), vec!["a b c".to_string()]);
     }
 
@@ -287,22 +311,20 @@ mod tests {
     fn shared_engine_matches_owned_engine() {
         // The free `wrap` (shared per-thread engine) must agree with a fresh
         // `TextEngine` on the same input — otherwise layout's line count would
-        // diverge from render's line count.
-        let s = TextStyle {
-            family: "sans-serif",
-            size: 16.0,
-            bold: false,
-            italic: false,
-        };
+        // diverge from render's line count. The shared engine is created lazily
+        // as a *system*-font engine; before measuring we seed it with the same
+        // vendored Tuffy face via the public `with_shaper` hook so the
+        // comparison is like-for-like and never depends on the host having
+        // fonts installed.
+        super::with_shaper(|shaper| shaper.add_font(Arc::new(TUFFY_TTF.to_vec())));
+        let s = tuffy_style();
         let text = "wrap this at a narrow width to force multiple lines here";
-        let owned = TextEngine::new().wrap(text, 100.0, s);
+        let owned = test_engine().wrap(text, 100.0, s);
         let shared = super::wrap(text, 100.0, s);
-        if cfg!(windows) {
-            assert_eq!(
-                owned, shared,
-                "shared engine must produce identical line breaks"
-            );
-        }
+        assert_eq!(
+            owned, shared,
+            "shared engine must produce identical line breaks"
+        );
     }
 
     #[test]
