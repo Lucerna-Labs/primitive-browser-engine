@@ -54,7 +54,14 @@ pub fn decode(bytes: &[u8]) -> Option<Image> {
     let height = rgba.height();
     let pixels = rgba
         .pixels()
-        .map(|p| Rgba::new(p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, p[3] as f32 / 255.0))
+        .map(|p| {
+            Rgba::new(
+                p[0] as f32 / 255.0,
+                p[1] as f32 / 255.0,
+                p[2] as f32 / 255.0,
+                p[3] as f32 / 255.0,
+            )
+        })
         .collect();
     Some(Image {
         width,
