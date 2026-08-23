@@ -1,0 +1,9 @@
+[package]
+name = "pbe-proto-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "data: URI protocol crate (RFC 2397) — decodes text and base64 data URIs. Zero dependencies, zero I/O: pure byte work."
+
+[dependencies]

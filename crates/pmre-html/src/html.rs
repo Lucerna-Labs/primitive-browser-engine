@@ -23,12 +23,40 @@
 //! font-weight, text-align, text-decoration, align-items, justify-content, opacity.
 //! Colors: #rgb/#rrggbb/#rrggbbaa, rgb()/rgba(), hsl(), ~40 named colors.
 
-use crate::css::{self, Rule};
+use crate::css::{self, InteractionState, Rule};
 use pmre_core::paint::Rgba;
 use pmre_layout::ux::{Align, Dim, Dir, Edges, Justify, Shadow, Span, Style, UxNode};
 use pmre_raster::raster::Image;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Numeric widget ids allocated to HTML form controls (`<input>`, `<button>`,
+/// `<textarea>`, `<select>`) so the orchestrator's `UiState` can track them
+/// interactively. Starts at `FORM_BASE` — well above the browser chrome's
+/// reserved range (1–99 in `pbe-shell`) so a page's controls never collide
+/// with the address bar / nav buttons.
+const FORM_BASE: u32 = 1000;
+
+/// Per-parse monotonic id allocator for form controls. Cheap `Cell<u32>`;
+/// one counter per `parse_with_images` call, so ids are stable within a
+/// single render but don't leak across pages.
+struct IdAlloc {
+    next: Cell<u32>,
+}
+
+impl IdAlloc {
+    fn new() -> Self {
+        IdAlloc {
+            next: Cell::new(FORM_BASE),
+        }
+    }
+    fn alloc(&self) -> u32 {
+        let id = self.next.get();
+        self.next.set(id + 1);
+        id
+    }
+}
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
 
@@ -59,11 +87,15 @@ enum Dom {
         /// `<img>`-specific attrs (src/alt/width/height). `None` on every
         /// other element.
         img_attrs: Option<ImgAttrs>,
+        /// The `type="..."` attribute for `<input>`/`<button>` (text,
+        /// checkbox, submit, ...). `None` on every other element.
+        form_type: Option<String>,
         kids: Vec<Dom>,
     },
     Text(String),
 }
 
+#[allow(clippy::large_enum_variant)] // Open carries the full attr set; Tok is transient
 enum Tok {
     Open {
         tag: String,
@@ -72,6 +104,7 @@ enum Tok {
         classes: Vec<String>,
         id_attr: Option<String>,
         img_attrs: Option<ImgAttrs>,
+        form_type: Option<String>,
         self_close: bool,
     },
     Close(String),
@@ -173,13 +206,43 @@ pub fn parse(src: &str) -> UxNode {
 /// dropped, matching the doctrine boundary: the kit does not fetch — it only
 /// renders what it's given.
 pub fn parse_with_images(src: &str, images: &HashMap<String, Arc<Image>>) -> UxNode {
+    parse_with_images_and_interaction(src, images, InteractionState::default())
+}
+
+/// Like [`parse_with_images`] but the caller supplies the interaction state
+/// (which element id is hovered / focused) so `:hover` / `:focus` pseudo-class
+/// rules apply. The browser calls this on re-render after a hover/focus change.
+pub fn parse_with_images_and_interaction(
+    src: &str,
+    images: &HashMap<String, Arc<Image>>,
+    interaction: InteractionState,
+) -> UxNode {
+    parse_with_images_interaction_viewport(
+        src,
+        images,
+        interaction,
+        crate::css::Viewport::default(),
+    )
+}
+
+/// The fully-parameterized parse: HTML + images + interaction state + viewport.
+/// `@media` queries are evaluated against `vp`; `:hover`/`:focus` against
+/// `interaction`. The browser calls this on every render with the current
+/// window size and hover/focus state.
+pub fn parse_with_images_interaction_viewport(
+    src: &str,
+    images: &HashMap<String, Arc<Image>>,
+    interaction: InteractionState,
+    vp: crate::css::Viewport,
+) -> UxNode {
     let toks = tokenize(src);
     let mut pos = 0usize;
     let roots = parse_nodes(&toks, &mut pos, None, 0);
     let mut style_text = String::new();
     collect_style_text(&roots, &mut style_text);
-    let sheet = css::parse_stylesheet(&style_text);
+    let sheet = css::parse_stylesheet_with_viewport(&style_text, vp);
     let mut ancestors: Vec<AncestorStackFrame> = Vec::new();
+    let ids = IdAlloc::new();
     let kids = children_to_ux(
         &roots,
         Inherited::default(),
@@ -189,6 +252,8 @@ pub fn parse_with_images(src: &str, images: &HashMap<String, Arc<Image>>) -> UxN
         images,
         ParentList::None,
         &mut ancestors,
+        &ids,
+        interaction,
     );
     if kids.len() == 1 {
         kids.into_iter().next().unwrap()
@@ -233,10 +298,7 @@ fn is_inline(tag: &str) -> bool {
 }
 
 fn is_dropped(tag: &str) -> bool {
-    matches!(
-        tag,
-        "img" | "input" | "meta" | "link" | "head" | "title" | "style"
-    )
+    matches!(tag, "img" | "meta" | "link" | "head" | "title" | "style")
 }
 
 // ─── Tokenizer ───────────────────────────────────────────────────────────────
@@ -363,7 +425,8 @@ fn tokenize(src: &str) -> Vec<Tok> {
             } else {
                 let self_close = inner.ends_with('/');
                 let inner = inner.trim_end_matches('/').trim();
-                let (tag, style_attr, href_attr, classes, id_attr, img_attrs) = parse_open(inner);
+                let (tag, style_attr, href_attr, classes, id_attr, img_attrs, form_type) =
+                    parse_open(inner);
                 // Raw-content element: skip everything until the matching
                 // close tag, scanning in place (no copy/lowercase of the
                 // whole remainder). Only <script> — its JS isn't executed,
@@ -394,6 +457,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
                     classes,
                     id_attr,
                     img_attrs,
+                    form_type,
                     self_close,
                 });
             }
@@ -435,6 +499,7 @@ fn parse_open(
     Vec<String>,
     Option<String>,
     Option<ImgAttrs>,
+    Option<String>,
 ) {
     let mut it = inner.splitn(2, char::is_whitespace);
     let tag = it.next().unwrap_or("").to_ascii_lowercase();
@@ -458,6 +523,11 @@ fn parse_open(
     } else {
         None
     };
+    let form_type = if tag == "input" || tag == "button" {
+        find_attr(attrs, "type")
+    } else {
+        None
+    };
     (
         tag,
         find_attr(attrs, "style"),
@@ -465,6 +535,7 @@ fn parse_open(
         classes,
         id_attr,
         img_attrs,
+        form_type,
     )
 }
 
@@ -544,6 +615,7 @@ fn parse_nodes(toks: &[Tok], pos: &mut usize, stop: Option<&str>, depth: usize) 
                 classes,
                 id_attr,
                 img_attrs,
+                form_type,
                 self_close,
             } => {
                 let tag = tag.clone();
@@ -552,6 +624,7 @@ fn parse_nodes(toks: &[Tok], pos: &mut usize, stop: Option<&str>, depth: usize) 
                 let classes = classes.clone();
                 let id_attr = id_attr.clone();
                 let img_attrs = img_attrs.clone();
+                let form_type = form_type.clone();
                 let self_close = *self_close || depth >= MAX_DOM_DEPTH;
                 *pos += 1;
                 let kids = if self_close {
@@ -566,6 +639,7 @@ fn parse_nodes(toks: &[Tok], pos: &mut usize, stop: Option<&str>, depth: usize) 
                     classes,
                     id_attr,
                     img_attrs,
+                    form_type,
                     kids,
                 });
             }
@@ -673,16 +747,20 @@ fn borrow_ancestors<'a>(
 fn matched_rules<'a>(
     sheet: &'a [Rule],
     ancestors: &[AncestorStackFrame],
+    siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
 ) -> Vec<&'a Rule> {
-    let mut scratch: Vec<Vec<&str>> = Vec::with_capacity(ancestors.len());
-    let borrowed = borrow_ancestors(ancestors, &mut scratch);
+    let mut scratch_a: Vec<Vec<&str>> = Vec::with_capacity(ancestors.len());
+    let borrowed_a = borrow_ancestors(ancestors, &mut scratch_a);
+    let mut scratch_s: Vec<Vec<&str>> = Vec::with_capacity(siblings.len());
+    let borrowed_s = borrow_ancestors(siblings, &mut scratch_s);
     let mut matched: Vec<(&Rule, (u32, u32, u32))> = sheet
         .iter()
         .filter_map(|r| {
-            r.specificity_if_matches(&borrowed, tag, id, classes)
+            r.specificity_if_matches(&borrowed_a, &borrowed_s, interaction, tag, id, classes)
                 .map(|sp| (r, sp))
         })
         .collect();
@@ -719,13 +797,15 @@ fn apply_cascade(
     inh: &mut Inherited,
     sheet: &[Rule],
     ancestors: &[AncestorStackFrame],
+    siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
     tag: &str,
     id: Option<&str>,
     classes: &[&str],
     inline_style: Option<&str>,
 ) -> bool {
     let mut hidden = false;
-    for r in matched_rules(sheet, ancestors, tag, id, classes) {
+    for r in matched_rules(sheet, ancestors, siblings, interaction, tag, id, classes) {
         apply_css(style, inh, &r.declarations);
         if let Some(is_none) = declares_display_none(&r.declarations) {
             hidden = is_none;
@@ -764,10 +844,15 @@ fn children_to_ux(
     images: &HashMap<String, Arc<Image>>,
     parent_list: ParentList,
     ancestors: &mut Vec<AncestorStackFrame>,
+    ids: &IdAlloc,
+    interaction: InteractionState,
 ) -> Vec<UxNode> {
     let mut out: Vec<UxNode> = Vec::new();
     let mut run: Vec<Span> = Vec::new();
     let mut first_flush = true;
+    // Preceding sibling elements within this parent, nearest-last, so + / ~
+    // combinators can match. Reset per children_to_ux call (per parent).
+    let mut prev_siblings: Vec<AncestorStackFrame> = Vec::new();
     // Sequential index of the current `<li>` sibling under this list — only
     // used when `parent_list` is `Ordered`; increments as each `<li>` is
     // dispatched so the numeric prefix reflects source order.
@@ -829,7 +914,16 @@ fn children_to_ux(
                     sheet,
                     &mut run,
                     ancestors,
+                    &prev_siblings,
+                    interaction,
                 );
+                // Record this inline element as a preceding sibling for the
+                // next sibling's + / ~ combinators.
+                prev_siblings.push((
+                    tag.to_string(),
+                    id_attr.as_deref().map(str::to_string),
+                    classes.to_vec(),
+                ));
                 if flex_row {
                     flush(&mut run, &mut out, &mut first_flush);
                 }
@@ -840,6 +934,7 @@ fn children_to_ux(
                 classes,
                 id_attr,
                 img_attrs,
+                form_type,
                 kids: inner,
                 ..
             } => {
@@ -866,14 +961,25 @@ fn children_to_ux(
                     classes,
                     style_attr.as_deref(),
                     img_attrs.as_ref(),
+                    form_type.as_deref(),
                     inner,
                     inh,
                     prefix,
                     sheet,
                     images,
                     ancestors,
+                    ids,
+                    &prev_siblings,
+                    interaction,
                 ) {
                     out.push(node);
+                    // Record this block element as a preceding sibling for
+                    // the next sibling's + / ~ combinators.
+                    prev_siblings.push((
+                        tag.to_string(),
+                        id_attr.as_deref().map(str::to_string),
+                        classes.to_vec(),
+                    ));
                 }
             }
         }
@@ -911,6 +1017,8 @@ fn inline_spans(
     sheet: &[Rule],
     run: &mut Vec<Span>,
     ancestors: &mut Vec<AncestorStackFrame>,
+    siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
 ) {
     let mut inh = inh;
     inh.font_size = tag_font(tag, inh.font_size);
@@ -933,6 +1041,8 @@ fn inline_spans(
         &mut inh,
         sheet,
         ancestors,
+        siblings,
+        interaction,
         tag,
         id,
         &class_refs,
@@ -969,6 +1079,10 @@ fn inline_spans(
                     sheet,
                     run,
                     ancestors,
+                    // Nested inline elements have no block-sibling context to
+                    // carry here (they coalesce into the same Rich flow).
+                    &[],
+                    interaction,
                 )
             }
             _ => {} // block inside inline: out of subset, dropped
@@ -984,12 +1098,16 @@ fn elem_to_ux(
     classes: &[String],
     style_attr: Option<&str>,
     img_attrs: Option<&ImgAttrs>,
+    form_type: Option<&str>,
     kids: &[Dom],
     inh: Inherited,
     li_prefix: Option<String>,
     sheet: &[Rule],
     images: &HashMap<String, Arc<Image>>,
     ancestors: &mut Vec<AncestorStackFrame>,
+    ids: &IdAlloc,
+    siblings: &[AncestorStackFrame],
+    interaction: InteractionState,
 ) -> Option<UxNode> {
     // <img>: emit a UxNode::Image if the src is in the pre-fetched map, drop
     // otherwise. This runs *before* `is_dropped(tag)` so an img with a hit
@@ -1014,6 +1132,57 @@ fn elem_to_ux(
             }
         }
     }
+    // <input>/<button>/<textarea>/<select>: interactive form controls. The
+    // kit's layout/paint already supports interactive roles (Style::input /
+    // Style::button, hit-tested by the orchestrator's UiState); the gap was
+    // only that the HTML reducer dropped these tags. Each gets a stable
+    // numeric widget id (allocated from `ids`, base 1000+) so the browser
+    // shell can track focus/value across renders. <form> itself is just a
+    // container Box (already handled by the generic path below).
+    if matches!(tag, "input" | "button" | "textarea" | "select") {
+        let wid = ids.alloc();
+        let mut style = tag_default_style(tag);
+        let mut inh2 = inh;
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let _ = apply_cascade(
+            &mut style,
+            &mut inh2,
+            sheet,
+            ancestors,
+            siblings,
+            interaction,
+            tag,
+            id,
+            &class_refs,
+            style_attr,
+        );
+        let style = match tag {
+            "button" | "select" => style.button(wid),
+            _ => style.input(wid),
+        };
+        // A <button>/<select> with text children renders its label inline;
+        // an <input> is a void control with no children.
+        let children = if matches!(tag, "button" | "select") {
+            let child_ids = IdAlloc::new();
+            children_to_ux(
+                kids,
+                inh2,
+                None,
+                false,
+                sheet,
+                images,
+                ParentList::None,
+                ancestors,
+                &child_ids,
+                interaction,
+            )
+        } else {
+            Vec::new()
+        };
+        let _ = form_type; // captured for future type-specific styling
+        return Some(UxNode::Box { style, children });
+    }
+
     if is_dropped(tag) {
         return None;
     }
@@ -1029,6 +1198,8 @@ fn elem_to_ux(
         &mut inh2,
         sheet,
         ancestors,
+        siblings,
+        interaction,
         tag,
         id,
         &class_refs,
@@ -1058,6 +1229,8 @@ fn elem_to_ux(
         images,
         this_list,
         ancestors,
+        ids,
+        interaction,
     );
     ancestors.pop();
     Some(UxNode::Box { style, children })
@@ -1781,29 +1954,122 @@ mod tests {
     }
 
     #[test]
-    fn child_combinator_still_dropped() {
-        // `>` isn't supported — the rule matches nothing.
-        let doc =
-            r#"<style>div > p { width: 999px; } p { height: 5px; }</style><div><p></p></div>"#;
+    fn child_combinator_matches_direct_child_only() {
+        // `>` (child combinator) is now supported: the rule applies to a
+        // `<p>` that is a *direct* child of a `<div>`, but not to a `<p>`
+        // nested deeper (a grandchild). Count the <p> nodes that picked up
+        // the 999px width — exactly one (the direct child).
+        let doc = r#"<style>div > p { width: 999px; }</style>
+            <div><p></p><section><p></p></section></div>"#;
         let root = parse(doc);
-        fn find_p_width(node: &UxNode) -> Option<f32> {
+        fn count_p_with_width(node: &UxNode, want: f32) -> usize {
             if let UxNode::Box { style, children } = node {
-                if let Dim::Px(w) = style.width {
-                    if (w - 999.0).abs() < 0.01 {
-                        return Some(w);
-                    }
-                }
-                for c in children {
-                    if let Some(w) = find_p_width(c) {
-                        return Some(w);
-                    }
+                let self_match = matches!(style.width, Dim::Px(w) if (w - want).abs() < 0.01);
+                let kids: usize = children.iter().map(|c| count_p_with_width(c, want)).sum();
+                (if self_match { 1 } else { 0 }) + kids
+            } else {
+                0
+            }
+        }
+        assert_eq!(
+            count_p_with_width(&root, 999.0),
+            1,
+            "child combinator should match exactly the direct-child <p>"
+        );
+    }
+
+    #[test]
+    fn hover_pseudo_class_applies_when_hovered() {
+        // #btn:hover colours the button red only when it's the hovered id.
+        let doc = r#"<style>#btn:hover { background: #ff0000; }</style>
+            <div id="btn"></div>"#;
+        let interaction = crate::css::InteractionState {
+            hovered_id: Some("btn"),
+            focused_id: None,
+        };
+        let root =
+            parse_with_images_and_interaction(doc, &std::collections::HashMap::new(), interaction);
+        if let UxNode::Box { .. } = &root {
+            // The div#btn is the root (only child collapses up); its background
+            // should be red when hovered. Find the box with a background set.
+            fn find_red_bg(node: &UxNode) -> bool {
+                if let UxNode::Box { style, children } = node {
+                    let self_red = style
+                        .background
+                        .map(|c| c.r > 0.9 && c.g < 0.1 && c.b < 0.1)
+                        .unwrap_or(false);
+                    self_red || children.iter().any(find_red_bg)
+                } else {
+                    false
                 }
             }
-            None
+            assert!(
+                find_red_bg(&root),
+                "hovered #btn should have a red background"
+            );
         }
-        assert!(
-            find_p_width(&root).is_none(),
-            "child combinator `>` must not silently degrade to descendant"
+        // Not hovered -> no red background.
+        let root2 = parse_with_images_and_interaction(
+            doc,
+            &std::collections::HashMap::new(),
+            crate::css::InteractionState::default(),
+        );
+        fn find_red_bg2(node: &UxNode) -> bool {
+            if let UxNode::Box { style, children } = node {
+                let self_red = style
+                    .background
+                    .map(|c| c.r > 0.9 && c.g < 0.1 && c.b < 0.1)
+                    .unwrap_or(false);
+                self_red || children.iter().any(find_red_bg2)
+            } else {
+                false
+            }
+        }
+        assert!(!find_red_bg2(&root2), "non-hovered #btn should not be red");
+    }
+
+    #[test]
+    fn adjacent_sibling_combinator_applies() {
+        // h1 + p applies to a <p> that immediately follows an <h1> sibling,
+        // but not to a <p> that follows a <div> sibling.
+        let doc = r#"<style>h1 + p { width: 999px; }</style>
+            <div><h1>title</h1><p id="after-h1"></p><div>x</div><p id="after-div"></p></div>"#;
+        let root = parse(doc);
+        fn count_p_with_width(node: &UxNode, want: f32) -> usize {
+            if let UxNode::Box { style, children } = node {
+                let self_match = matches!(style.width, Dim::Px(w) if (w - want).abs() < 0.01);
+                let kids: usize = children.iter().map(|c| count_p_with_width(c, want)).sum();
+                (if self_match { 1 } else { 0 }) + kids
+            } else {
+                0
+            }
+        }
+        assert_eq!(
+            count_p_with_width(&root, 999.0),
+            1,
+            "adjacent sibling should match exactly the <p> right after <h1>"
+        );
+    }
+
+    #[test]
+    fn general_sibling_combinator_applies() {
+        // h1 ~ p applies to every <p> that follows an <h1> sibling (two here).
+        let doc = r#"<style>h1 ~ p { width: 777px; }</style>
+            <div><h1>t</h1><p></p><div>x</div><p></p></div>"#;
+        let root = parse(doc);
+        fn count_p_with_width(node: &UxNode, want: f32) -> usize {
+            if let UxNode::Box { style, children } = node {
+                let self_match = matches!(style.width, Dim::Px(w) if (w - want).abs() < 0.01);
+                let kids: usize = children.iter().map(|c| count_p_with_width(c, want)).sum();
+                (if self_match { 1 } else { 0 }) + kids
+            } else {
+                0
+            }
+        }
+        assert_eq!(
+            count_p_with_width(&root, 777.0),
+            2,
+            "general sibling should match both <p>s after the <h1>"
         );
     }
 
@@ -2080,5 +2346,68 @@ mod tests {
             }
         }
         assert!(!has_image(&root));
+    }
+
+    #[test]
+    fn input_control_renders_as_interactive_box_not_dropped() {
+        let root = parse(r#"<form><input type="text"></form>"#);
+        // The <input> must reach the render tree as an interactive Box
+        // (not be dropped as it was before form-control support).
+        fn has_input(node: &UxNode) -> bool {
+            if let UxNode::Box { style, children } = node {
+                style.role == pmre_layout::ux::Role::Input || children.iter().any(has_input)
+            } else {
+                false
+            }
+        }
+        assert!(has_input(&root), "expected an <input> to render");
+    }
+
+    #[test]
+    fn button_control_renders_with_label_text() {
+        let root = parse(r#"<button>Click me</button>"#);
+        fn has_button_with_text(node: &UxNode) -> bool {
+            if let UxNode::Box { style, children } = node {
+                (style.role == pmre_layout::ux::Role::Button
+                    && children
+                        .iter()
+                        .any(|c| matches!(c, UxNode::Rich { .. } | UxNode::Text { .. })))
+                    || children.iter().any(has_button_with_text)
+            } else {
+                false
+            }
+        }
+        assert!(
+            has_button_with_text(&root),
+            "expected a <button> with its label text"
+        );
+    }
+
+    #[test]
+    fn multiple_inputs_get_distinct_widget_ids() {
+        // Two <input> controls in the same parse must each get a unique
+        // numeric widget id so the orchestrator's UiState tracks them
+        // independently (no id collision with the chrome's 1-99 range).
+        let root = parse(r#"<div><input><input></div>"#);
+        let mut ids = Vec::new();
+        fn collect_input_ids(node: &UxNode, ids: &mut Vec<u32>) {
+            if let UxNode::Box { style, children } = node {
+                if style.role == pmre_layout::ux::Role::Input {
+                    if let Some(id) = style.id {
+                        ids.push(id);
+                    }
+                }
+                for c in children {
+                    collect_input_ids(c, ids);
+                }
+            }
+        }
+        collect_input_ids(&root, &mut ids);
+        assert_eq!(ids.len(), 2, "expected two inputs");
+        assert_ne!(ids[0], ids[1], "inputs must have distinct ids");
+        assert!(
+            ids.iter().all(|&i| i >= 1000),
+            "ids must be >= 1000 (FORM_BASE)"
+        );
     }
 }

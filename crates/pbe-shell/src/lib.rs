@@ -10,11 +10,14 @@
 //! chrome (the buttons/input around it) — the two things `pmre-kit` doesn't
 //! have an opinion on.
 
+use pbe_js::{DomHooks, FetchHook, JsRuntime, LogSink, WsHook};
 use pmre_kit::raster::{decode_bmp, decode_png, Image};
 use pmre_kit::ux::{Align, Dim, Edges, Justify, Style, UxNode};
 use pmre_kit::{Framebuffer, Rgba};
 use pmre_orchestrator::UiState;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub use pmre_orchestrator::{handle_event, render_ui, render_ui_quality, Quality, UiEvent};
@@ -48,14 +51,29 @@ enum Origin {
 }
 
 fn classify(address: &str) -> Origin {
-    if address.starts_with("http://") || address.starts_with("https://") {
+    // The modern protocols the engine speaks: http(s), ws(s), and data:.
+    // Each is routed through pbe_net (which dispatches to the matching
+    // pbe-proto-* crate). Anything else is a local file path.
+    if is_network_scheme(address) {
         Origin::Url(address.to_string())
     } else {
         Origin::File(address.to_string())
     }
 }
 
-fn load(origin: &Origin) -> (String, UxNode) {
+/// Whether `address` begins with one of the modern fetch protocols the
+/// modular protocol layer routes (http/https/ws/wss/data). Everything else
+/// is treated as a local file path.
+fn is_network_scheme(address: &str) -> bool {
+    let a = address.to_ascii_lowercase();
+    a.starts_with("http://")
+        || a.starts_with("https://")
+        || a.starts_with("ws://")
+        || a.starts_with("wss://")
+        || a.starts_with("data:")
+}
+
+fn load(origin: &Origin) -> (String, UxNode, Option<Box<JsRuntime>>) {
     let (label, html) = match origin {
         Origin::File(path) => {
             let html = std::fs::read_to_string(path)
@@ -81,10 +99,166 @@ fn load(origin: &Origin) -> (String, UxNode) {
     // never fetches or decodes anything the browser hasn't already given it —
     // the composition boundary stays at the browser layer.
     let images = fetch_page_images(&label, &augmented);
+    // Run any <script> blocks through the JS engine (boa). Page scripts can
+    // mutate document.title (reflected in the returned label) and call
+    // fetch() through the engine's own protocol layer. Script errors are
+    // non-fatal — a failing script logs + continues, like a real browser.
+    let (label, js) = run_scripts(&label, &augmented);
     (
         label,
         pmre_kit::html::parse_with_images(&augmented, &images),
+        js,
     )
+}
+
+/// Scan `html` for `<script>...</script>` blocks and run each through a fresh
+/// [`JsRuntime`] with the browser's hooks installed: `console.log` → stderr,
+/// `document.title` get/set → the page label, `fetch(url)` → the engine's
+/// protocol layer. Returns the (possibly JS-mutated) page label. Per-script
+/// failures are non-fatal — logged to stderr, never aborting the page load
+/// (matching real-browser behaviour). External `<script src=...>` is a future
+/// extension; today only inline scripts run.
+fn run_scripts(label: &str, html: &str) -> (String, Option<Box<JsRuntime>>) {
+    let scripts = find_scripts(html);
+    if scripts.is_empty() {
+        return (label.to_string(), None);
+    }
+    let title: Rc<RefCell<String>> = Rc::new(RefCell::new(label.to_string()));
+    let log: Rc<RefCell<dyn LogSink>> = Rc::new(RefCell::new(StderrLog));
+    let dom: Rc<RefCell<dyn DomHooks>> = Rc::new(RefCell::new(TitleDom {
+        title: title.clone(),
+    }));
+    let fetch: Rc<RefCell<dyn FetchHook>> = Rc::new(RefCell::new(ProtoFetch));
+    let ws: Rc<RefCell<dyn WsHook>> = Rc::new(RefCell::new(BrowserWs));
+    let mut rt = JsRuntime::with_bindings(log, dom, fetch, ws);
+    for block in &scripts {
+        // External <script src="...">: fetch (URL via the protocol layer, local
+        // path via std::fs), then run the fetched text. Inline <script>: run
+        // the body directly. Per-script failures are non-fatal.
+        let code = if let Some(src) = &block.src {
+            let resolved = resolve_href(label, src);
+            match fetch_script_text(&resolved) {
+                Some(text) => text,
+                None => {
+                    eprintln!("script fetch failed: {resolved}");
+                    continue;
+                }
+            }
+        } else {
+            block.body.clone()
+        };
+        if let Err(e) = rt.run(&code) {
+            eprintln!("script error: {e}");
+        }
+    }
+    let final_title = title.borrow().clone();
+    (final_title, Some(Box::new(rt)))
+}
+
+struct BrowserWs;
+impl WsHook for BrowserWs {
+    fn open(&mut self, url: &str) -> bool {
+        WS_REQUEST.with(|c| *c.borrow_mut() = Some(url.to_string()));
+        true
+    }
+    fn send(&mut self, _msg: &str) -> bool {
+        false
+    }
+}
+
+thread_local! {
+    static WS_REQUEST: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Fetch external script text over the same on-ramps stylesheets use:
+/// `pbe_net::fetch` for URLs, `std::fs` for local paths. Returns `None` on
+/// any failure (the caller treats a missing script as non-fatal, like a real
+/// browser).
+fn fetch_script_text(target: &str) -> Option<String> {
+    if is_network_scheme(target) {
+        pbe_net::fetch(target).ok().map(|p| p.body)
+    } else {
+        std::fs::read_to_string(target).ok()
+    }
+}
+
+/// One `<script>` block: either an external `src` (fetched + run) or inline
+/// body text (run directly). Both arrive in source order.
+struct ScriptBlock {
+    src: Option<String>,
+    body: String,
+}
+
+/// Extract each `<script ...>...</script>` block in source order. Captures the
+/// `src="..."` attribute when present (external script) and the inline body
+/// otherwise. Tolerant of attribute-bearing opening tags and unclosed scripts.
+fn find_scripts(html: &str) -> Vec<ScriptBlock> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("<script").map(|k| i + k) {
+        let tag_start = rel;
+        let Some(close_rel) = lower[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + close_rel; // index of '>'
+        let tag_slice = &html[tag_start..tag_end];
+        let src = attr_value(tag_slice, "src");
+        let body_start = tag_end + 1;
+        let body = match lower[body_start..].find("</script>") {
+            Some(end_rel) => {
+                let body_end = body_start + end_rel;
+                let b = html[body_start..body_end].to_string();
+                i = body_end + "</script>".len();
+                b
+            }
+            None => {
+                // Unclosed script: take the rest as body (lenient).
+                let b = html[body_start..].to_string();
+                i = html.len();
+                b
+            }
+        };
+        out.push(ScriptBlock { src, body });
+    }
+    out
+}
+
+/// A console sink that writes to stderr (the same place the orchestrator
+/// binary prints fetch progress).
+struct StderrLog;
+impl LogSink for StderrLog {
+    fn log(&mut self, msg: &str) {
+        eprintln!("console: {msg}");
+    }
+    fn error(&mut self, msg: &str) {
+        eprintln!("console.error: {msg}");
+    }
+}
+
+/// DOM hook: `document.title` get/set backed by the page label.
+struct TitleDom {
+    title: Rc<RefCell<String>>,
+}
+impl DomHooks for TitleDom {
+    fn get_title(&self) -> String {
+        self.title.borrow().clone()
+    }
+    fn set_title(&mut self, title: String) {
+        *self.title.borrow_mut() = title;
+    }
+}
+
+/// Fetch hook: route JS `fetch(url)` through the engine's modular protocol
+/// layer (pbe_proto), which dispatches http/ws/data. Returns (status, text).
+struct ProtoFetch;
+impl FetchHook for ProtoFetch {
+    fn fetch(&mut self, url: &str) -> (u16, String) {
+        match pbe_proto::fetch(url) {
+            Ok(r) => (r.status, r.text()),
+            Err(e) => (0, format!("fetch error: {e}")),
+        }
+    }
 }
 
 /// Scan `html` for `<img src="…">` tags, fetch and decode each into an
@@ -123,21 +297,23 @@ fn fetch_page_images(base: &str, html: &str) -> HashMap<String, Arc<Image>> {
 /// gets its bytes replaced with U+FFFD" defect that the first cut of img
 /// support shipped with.
 fn fetch_image_bytes(target: &str) -> Option<Vec<u8>> {
-    if target.starts_with("http://") || target.starts_with("https://") {
+    if is_network_scheme(target) {
         pbe_net::fetch_bytes(target).ok().map(|p| p.body)
     } else {
         std::fs::read(target).ok()
     }
 }
 
-/// Try BMP and PNG decoders in turn on the given bytes. Returns `None` if
-/// neither format matches — future decoders (JPEG, WebP, GIF) would join the
-/// same dispatch here.
+/// Try the kit's BMP/PNG decoders, then the modular `pbe-img-codecs` crate
+/// (JPEG/WebP/GIF) on the given bytes. Returns `None` if no decoder matches
+/// — the browser renders the alt text in that case, never aborts the page.
 fn decode_image_bytes(bytes: &[u8]) -> Option<Image> {
     if bytes.starts_with(b"BM") {
         decode_bmp(bytes)
     } else if bytes.len() >= 8 && bytes[0..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
         decode_png(bytes)
+    } else if pbe_img_codecs::handles(bytes) {
+        pbe_img_codecs::decode(bytes)
     } else {
         None
     }
@@ -196,7 +372,7 @@ fn inject_external_stylesheets(base: &str, html: &str) -> String {
 /// `pbe_net::fetch` for URLs, `std::fs` for local paths. Returns `None` on
 /// any failure — the caller treats missing sheets as no styling, not fatal.
 fn fetch_stylesheet_text(target: &str) -> Option<String> {
-    if target.starts_with("http://") || target.starts_with("https://") {
+    if is_network_scheme(target) {
         pbe_net::fetch(target).ok().map(|p| p.body)
     } else {
         std::fs::read_to_string(target).ok()
@@ -318,7 +494,9 @@ fn error_html(msg: &str) -> String {
 /// so this stays a plain string primitive rather than pulling one in for a
 /// handful of cases.
 fn resolve_href(base: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
+    // Absolute URLs of any modern protocol pass through untouched (http(s),
+    // ws(s), data:). Relative hrefs resolve against the base below.
+    if is_network_scheme(href) {
         return href.to_string();
     }
     if let Some(scheme_end) = base.find("://") {
@@ -367,6 +545,15 @@ pub struct Browser {
     /// without a wrapper method — same fields `pmre-orchestrator`'s own
     /// examples mutate directly.
     pub ui: UiState,
+    /// Inbox of text messages received from the page's open WebSocket, if any.
+    /// Drained by [`poll_websocket`](Browser::poll_websocket) so a caller can
+    /// surface server pushes in the rendered page.
+    ws_inbox: Vec<String>,
+    /// The live WebSocket connection, if one is open.
+    ws: Option<pbe_proto_ws::WsConnection>,
+    /// The JS runtime the page's <script> ran in, so received WebSocket
+    /// messages can be dispatched to the page's `onmessage` callback.
+    js: Option<Box<JsRuntime>>,
 }
 
 impl Browser {
@@ -383,7 +570,7 @@ impl Browser {
     }
 
     fn from_origin(origin: Origin, width: u32, height: u32) -> Self {
-        let (label, page_root) = load(&origin);
+        let (label, page_root, js) = load(&origin);
         let mut ui = UiState::new(width, height);
         ui.inputs.insert(ADDRESS_INPUT, label.clone());
         Self {
@@ -392,6 +579,9 @@ impl Browser {
             history: vec![origin],
             history_pos: 0,
             ui,
+            ws_inbox: Vec::new(),
+            ws: None,
+            js,
         }
     }
 
@@ -425,6 +615,81 @@ impl Browser {
         self.load_current();
     }
 
+    /// Open a persistent WebSocket connection to a `ws://`/`wss://` URL. The
+    /// connection stays open and is drained by [`poll_websocket`]; received
+    /// text messages accumulate in an inbox the caller can surface in the
+    /// rendered page. Closing any previously-open connection first.
+    ///
+    /// This wires the modular `pbe-proto-ws` crate's persistent connection
+    /// into the browser: a page can actually open a live `ws`/`wss`
+    /// connection and receive server-pushed messages, not just fetch the
+    /// handshake. Returns `Err` if the connection or handshake fails.
+    pub fn open_websocket(&mut self, url: &str) -> Result<(), String> {
+        let conn = pbe_proto_ws::connect(url).map_err(|e| format!("{e:?}"))?;
+        // Close any existing connection before replacing it.
+        if let Some(mut prev) = self.ws.take() {
+            let _ = prev.close();
+        }
+        self.ws = Some(conn);
+        Ok(())
+    }
+
+    /// Send a text message over the open WebSocket, if any.
+    pub fn send_websocket(&mut self, text: &str) -> Result<(), String> {
+        let conn = self
+            .ws
+            .as_mut()
+            .ok_or_else(|| "no open websocket".to_string())?;
+        conn.send_text(text).map_err(|e| format!("{e:?}"))
+    }
+
+    /// Drain any received text/binary messages from the open WebSocket into
+    /// the inbox and return the messages received since the last poll.
+    /// Binary messages are hex-encoded so they survive the `String` inbox.
+    /// Closes the connection (and returns the inbox) if the peer closed.
+    pub fn poll_websocket(&mut self) -> Vec<String> {
+        let Some(conn) = self.ws.as_mut() else {
+            return std::mem::take(&mut self.ws_inbox);
+        };
+        loop {
+            match conn.recv() {
+                Ok(Some((opcode, payload))) => match opcode {
+                    pbe_proto_ws::Opcode::Text => {
+                        let msg = String::from_utf8_lossy(&payload).to_string();
+                        self.ws_inbox.push(msg.clone());
+                        // Dispatch to the page's JS `onmessage` callback.
+                        if let Some(rt) = self.js.as_deref_mut() {
+                            rt.dispatch_ws_message(&msg);
+                        }
+                    }
+                    pbe_proto_ws::Opcode::Binary => {
+                        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+                        self.ws_inbox.push(hex);
+                    }
+                    _ => {}
+                },
+                Ok(None) => {
+                    // Peer closed; drop the connection.
+                    self.ws = None;
+                    break;
+                }
+                Err(_) => {
+                    // A read error (e.g. timeout with no data) means nothing
+                    // to drain right now; stop polling until next tick.
+                    break;
+                }
+            }
+        }
+        std::mem::take(&mut self.ws_inbox)
+    }
+
+    /// Close the open WebSocket, if any.
+    pub fn close_websocket(&mut self) {
+        if let Some(mut conn) = self.ws.take() {
+            let _ = conn.close();
+        }
+    }
+
     /// Navigate to a new address (typed into the bar or otherwise supplied).
     /// Truncates any forward history past the current point, like a real
     /// browser.
@@ -436,11 +701,19 @@ impl Browser {
     }
 
     fn load_current(&mut self) {
-        let (label, root) = load(&self.history[self.history_pos]);
+        let (label, root, js) = load(&self.history[self.history_pos]);
         self.label = label;
         self.page_root = root;
         self.ui.scrolls.remove(&PAGE_SCROLL);
         self.ui.inputs.insert(ADDRESS_INPUT, self.label.clone());
+        self.js = js;
+        // If the page's <script> asked to open a WebSocket (WebSocket.open in
+        // JS), open it now that the Browser is built.
+        WS_REQUEST.with(|c| {
+            if let Some(url) = c.borrow_mut().take() {
+                let _ = self.open_websocket(&url);
+            }
+        });
     }
 
     /// Feed one UI event through the chrome + page tree, then apply any
@@ -813,6 +1086,32 @@ mod image_scan_tests {
         assert!(decode_image_bytes(b"JPEG").is_none());
         assert!(decode_image_bytes(&[]).is_none());
     }
+
+    #[test]
+    fn decode_dispatch_routes_jpeg_to_img_codecs() {
+        // Synthesize a real 3x2 JPEG and confirm the dispatch routes it to
+        // pbe-img-codecs (not BMP/PNG) and decodes the dimensions back.
+        let img = image::RgbImage::from_pixel(3, 2, image::Rgb([40, 90, 160]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        let decoded = decode_image_bytes(&buf.into_inner()).expect("jpeg should decode");
+        assert_eq!(decoded.width, 3);
+        assert_eq!(decoded.height, 2);
+    }
+
+    #[test]
+    fn decode_dispatch_routes_webp_to_img_codecs() {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([15, 200, 75]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::WebP)
+            .unwrap();
+        let decoded = decode_image_bytes(&buf.into_inner()).expect("webp should decode");
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
+    }
 }
 
 #[cfg(test)]
@@ -882,7 +1181,7 @@ mod stylesheet_scan_tests {
 
 #[cfg(test)]
 mod resolve_href_tests {
-    use super::resolve_href;
+    use super::{classify, resolve_href, Origin};
 
     #[test]
     fn absolute_href_passes_through() {
@@ -926,5 +1225,114 @@ mod resolve_href_tests {
         let resolved = resolve_href(base, "about.html");
         assert!(resolved.ends_with("about.html"));
         assert!(resolved.contains("pages"));
+    }
+
+    #[test]
+    fn classify_treats_modern_schemes_as_urls() {
+        assert!(matches!(classify("https://example.com"), Origin::Url(_)));
+        assert!(matches!(classify("http://example.com"), Origin::Url(_)));
+        assert!(matches!(classify("ws://echo.example.com"), Origin::Url(_)));
+        assert!(matches!(classify("wss://echo.example.com"), Origin::Url(_)));
+        assert!(matches!(classify("data:,hello"), Origin::Url(_)));
+    }
+
+    #[test]
+    fn classify_treats_bare_paths_as_files() {
+        assert!(matches!(classify("page.html"), Origin::File(_)));
+        assert!(matches!(classify("/abs/path/page.html"), Origin::File(_)));
+    }
+
+    #[test]
+    fn classify_is_case_insensitive_on_scheme() {
+        assert!(matches!(classify("HTTPS://Example.COM"), Origin::Url(_)));
+        assert!(matches!(classify("WSS://echo.example.com"), Origin::Url(_)));
+        assert!(matches!(classify("DATA:,hi"), Origin::Url(_)));
+    }
+
+    #[test]
+    fn resolve_href_passes_through_ws_and_data_urls() {
+        assert_eq!(resolve_href("https://x/page", "ws://echo/x"), "ws://echo/x");
+        assert_eq!(
+            resolve_href("https://x/page", "wss://echo/x"),
+            "wss://echo/x"
+        );
+        assert_eq!(resolve_href("https://x/page", "data:,hello"), "data:,hello");
+    }
+}
+
+#[cfg(test)]
+mod websocket_tests {
+    use crate::Browser;
+
+    #[test]
+    fn poll_with_no_open_connection_returns_empty() {
+        let mut b = Browser::open_html("<p>x</p>", 100, 100);
+        assert!(b.poll_websocket().is_empty());
+    }
+
+    #[test]
+    fn close_with_no_open_connection_is_a_noop() {
+        let mut b = Browser::open_html("<p>x</p>", 100, 100);
+        b.close_websocket();
+        // No panic; connection field stays None.
+        assert!(b.poll_websocket().is_empty());
+    }
+
+    #[test]
+    fn send_with_no_open_connection_errors() {
+        let mut b = Browser::open_html("<p>x</p>", 100, 100);
+        assert!(b.send_websocket("hi").is_err());
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use crate::Browser;
+
+    #[test]
+    fn inline_script_sets_document_title() {
+        // A page whose <script> sets document.title should surface that title
+        // as the browser's page label (the JS engine runs during load).
+        let b = Browser::open_html(
+            r#"<script>document.setTitle("from-js")</script><p>hi</p>"#,
+            100,
+            100,
+        );
+        assert_eq!(b.label(), "from-js");
+    }
+
+    #[test]
+    fn a_failing_script_does_not_abort_the_page() {
+        // A script that throws must not abort the load; the page still
+        // renders (label is whatever it was before the throw).
+        let b = Browser::open_html(
+            r#"<script>throw new Error("boom")</script><p>still here</p>"#,
+            100,
+            100,
+        );
+        // Label isn't "from-js" (no setTitle ran), and the page loaded.
+        assert_ne!(b.label(), "from-js");
+    }
+
+    #[test]
+    fn external_script_src_is_fetched_and_run() {
+        // Write an external .js file that sets the title, reference it from
+        // <script src=>, and confirm the browser runs the fetched code.
+        let dir = std::env::temp_dir();
+        let js_path = dir.join(format!("pbe_ext_script_{}.js", std::process::id()));
+        std::fs::write(&js_path, "document.setTitle('from-external')").unwrap();
+        let html = format!(r#"<script src="{}"></script><p>hi</p>"#, js_path.display());
+        let b = Browser::open_html(&html, 100, 100);
+        // about:blank is the base label for an Html origin; the external
+        // script's resolved src is the absolute file path, which fetches.
+        assert_eq!(b.label(), "from-external");
+        let _ = std::fs::remove_file(&js_path);
+    }
+
+    #[test]
+    fn script_without_a_settitle_keeps_the_default_label() {
+        let b = Browser::open_html(r#"<script>var x = 1 + 1;</script><p>hi</p>"#, 100, 100);
+        // about:blank is the default label for an Html origin.
+        assert_eq!(b.label(), "about:blank");
     }
 }

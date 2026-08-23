@@ -1,0 +1,10 @@
+[package]
+name = "pbe-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "JavaScript engine for the browser \u2014 wraps boa (pure-Rust JS) with minimal console/document/fetch/WebSocket DOM bindings. One swappable crate; no C build chain."
+
+[dependencies]
+boa_engine = "0.20"

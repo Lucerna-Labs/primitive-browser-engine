@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Windowed browser shell — presents the engine's rendered frames in a real OS window with scroll, resize, and reload."
+description = "Windowed browser shell \u2014 presents the engine's rendered frames in a real OS window with scroll, resize, and reload."
 
 [[bin]]
 name = "pbe-window"
@@ -12,10 +12,17 @@ path = "src/main.rs"
 
 [dependencies]
 pbe-net = { workspace = true }
+pbe-proto = { workspace = true }
+pbe-proto-ws = { workspace = true }
+pbe-img-codecs = { workspace = true }
+pbe-js = { workspace = true }
 pmre-kit = { workspace = true }
 pmre-orchestrator = { workspace = true }
 # Real OS window + event loop, and a CPU framebuffer presenter (the engine's
-# software rasterizer already produces RGBA, so softbuffer blits it directly —
+# software rasterizer already produces RGBA, so softbuffer blits it directly \u2014
 # no GPU dependency for this milestone).
 winit = "0.30"
 softbuffer = "0.4"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp"] }

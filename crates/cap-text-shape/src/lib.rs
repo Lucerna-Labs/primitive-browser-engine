@@ -514,6 +514,25 @@ impl std::fmt::Debug for ShapeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// Build a shaper with the bundled Noto Sans Regular loaded and **no**
+    /// system fonts. The shape tests need a concrete font to shape against;
+    /// `CosmicShaper::new()` scans the OS font dirs and panics with
+    /// "no default font found" on a headless / locked-down host (CI
+    /// containers, this crate's own sandbox). Loading the bundled OFL
+    /// Noto Sans via [`CosmicShaper::add_font`] makes the tests hermetic
+    /// and deterministic — the same shape output on every machine — while
+    /// still exercising the real cosmic-text shaping path end to end.
+    fn bundled_shaper() -> CosmicShaper {
+        let bytes = include_bytes!("../tests/fixtures/NotoSans-Regular.ttf");
+        let mut shaper = CosmicShaper::new_without_system_fonts();
+        shaper.add_font(Arc::new(bytes.to_vec()));
+        shaper
+    }
+
+    /// The family name Noto Sans Regular exposes in its name table.
+    const NOTO_SANS: &str = "Noto Sans";
 
     /// Default constructor produces a usable shaper (system fonts
     /// available on the host).
@@ -536,15 +555,14 @@ mod tests {
     /// fonts vary by OS); we just check the line has at least one
     /// run + the total advance equals the sum of glyph advances.
     #[test]
-    fn shape_simple_string_against_system_fonts() {
-        let mut shaper = CosmicShaper::new();
+    fn shape_simple_string_against_bundled_font() {
+        let mut shaper = bundled_shaper();
         let line = shaper.shape(ShapeRequest {
             text: "hi",
-            // "sans-serif" is the cosmic-text generic that maps to
-            // whichever sans family the font_db settled on. Works
-            // on every desktop OS without bundling a specific font.
+            // Shape against the bundled Noto Sans Regular by family name —
+            // hermetic, no system-font dependency.
             font: FontDescriptor {
-                family: "sans-serif",
+                family: NOTO_SANS,
                 weight: FontWeight::Normal,
                 style: FontStyle::Normal,
             },
@@ -559,7 +577,7 @@ mod tests {
         // Width is computed by summing advances; round-trip should
         // match within float epsilon.
         assert!((total - line.width.0).abs() < 0.001);
-        // At least one run when the host has any sans family.
+        // At least one run — the bundled font shaped the glyphs.
         assert!(!line.runs.is_empty(), "expected at least one shaped run");
     }
 
@@ -612,12 +630,12 @@ mod tests {
     /// doesn't grow the entry count.
     #[test]
     fn shape_cache_dedups_repeated_requests() {
-        let mut shaper = CosmicShaper::new();
+        let mut shaper = bundled_shaper();
         let mut cache = ShapeCache::new();
         let request = || ShapeRequest {
             text: "hi",
             font: FontDescriptor {
-                family: "sans-serif",
+                family: NOTO_SANS,
                 weight: FontWeight::Normal,
                 style: FontStyle::Normal,
             },
@@ -636,14 +654,14 @@ mod tests {
     /// weight, style.
     #[test]
     fn shape_cache_keys_on_all_request_fields() {
-        let mut shaper = CosmicShaper::new();
+        let mut shaper = bundled_shaper();
         let mut cache = ShapeCache::new();
         cache.get_or_shape(
             &mut shaper,
             ShapeRequest {
                 text: "a",
                 font: FontDescriptor {
-                    family: "sans-serif",
+                    family: NOTO_SANS,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
@@ -655,7 +673,7 @@ mod tests {
             ShapeRequest {
                 text: "b", // different text
                 font: FontDescriptor {
-                    family: "sans-serif",
+                    family: NOTO_SANS,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
@@ -667,7 +685,7 @@ mod tests {
             ShapeRequest {
                 text: "a",
                 font: FontDescriptor {
-                    family: "sans-serif",
+                    family: NOTO_SANS,
                     weight: FontWeight::Bold, // different weight
                     style: FontStyle::Normal,
                 },
@@ -679,7 +697,7 @@ mod tests {
             ShapeRequest {
                 text: "a",
                 font: FontDescriptor {
-                    family: "sans-serif",
+                    family: NOTO_SANS,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },
@@ -692,7 +710,7 @@ mod tests {
     /// Cache evicts oldest entries past capacity.
     #[test]
     fn shape_cache_evicts_at_capacity() {
-        let mut shaper = CosmicShaper::new();
+        let mut shaper = bundled_shaper();
         let mut cache = ShapeCache::with_capacity(3);
         for n in 0..5 {
             let s = format!("text-{n}");
@@ -701,7 +719,7 @@ mod tests {
                 ShapeRequest {
                     text: &s,
                     font: FontDescriptor {
-                        family: "sans-serif",
+                        family: NOTO_SANS,
                         weight: FontWeight::Normal,
                         style: FontStyle::Normal,
                     },
@@ -716,14 +734,14 @@ mod tests {
     /// Cache `clear()` empties everything.
     #[test]
     fn shape_cache_clear_resets_state() {
-        let mut shaper = CosmicShaper::new();
+        let mut shaper = bundled_shaper();
         let mut cache = ShapeCache::new();
         cache.get_or_shape(
             &mut shaper,
             ShapeRequest {
                 text: "anything",
                 font: FontDescriptor {
-                    family: "sans-serif",
+                    family: NOTO_SANS,
                     weight: FontWeight::Normal,
                     style: FontStyle::Normal,
                 },

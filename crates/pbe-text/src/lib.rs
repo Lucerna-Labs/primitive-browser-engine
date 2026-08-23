@@ -18,6 +18,7 @@
 //! bus's parallel-strand model — not a leak.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use cap_geometry::Pixels;
 use cap_text_shape::{
@@ -98,10 +99,38 @@ pub struct TextEngine {
 
 impl TextEngine {
     pub fn new() -> Self {
+        let shaper = CosmicShaper::new();
+        Self::finish(shaper)
+    }
+
+    /// Build an engine with **no** system fonts — for hermetic tests and
+    /// headless / locked-down hosts where the OS font dirs are empty. The
+    /// bundled Noto Sans Regular is still loaded as the baseline font (see
+    /// [`Self::add_font`]), so shaping always has a concrete face to fall
+    /// back on and never panics with "no default font found".
+    pub fn new_without_system_fonts() -> Self {
+        let shaper = CosmicShaper::new_without_system_fonts();
+        Self::finish(shaper)
+    }
+
+    /// Common tail: load the bundled Noto Sans Regular baseline + build the
+    /// engine. Noto Sans is OFL-licensed (see tests/fixtures/NotoSans-LICENSE).
+    /// Loading it as a baseline means the engine always has at least one
+    /// font even on a host with no system fonts installed, so the default
+    /// `new()` and the shared thread-local engine never panic.
+    fn finish(mut shaper: CosmicShaper) -> Self {
+        let bytes = include_bytes!("../tests/fixtures/NotoSans-Regular.ttf");
+        shaper.add_font(Arc::new(bytes.to_vec()));
         Self {
-            shaper: RefCell::new(CosmicShaper::new()),
+            shaper: RefCell::new(shaper),
             cache: RefCell::new(ShapeCache::new()),
         }
+    }
+
+    /// Register an additional font from raw bytes (TTF / OTF). Shape against
+    /// its family name to use it.
+    pub fn add_font(&self, bytes: Arc<Vec<u8>>) {
+        self.shaper.borrow_mut().add_font(bytes);
     }
 
     /// Real measured width of one line of text, via the shaper (sum of glyph
@@ -228,54 +257,50 @@ mod tests {
 
     #[test]
     fn measure_is_monotonic_in_length() {
-        let e = TextEngine::new();
+        let e = TextEngine::new_without_system_fonts();
         let s = TextStyle {
-            family: "sans-serif",
+            family: "Noto Sans",
             size: 16.0,
             bold: false,
             italic: false,
         };
-        // A longer string measures at least as wide (with any real font).
+        // A longer string measures at least as wide (with the bundled font).
         let short = e.measure("hi", s);
         let long = e.measure("hello world, this is much longer", s);
-        if cfg!(windows) {
-            assert!(
-                long > short,
-                "longer text should be wider: {short} vs {long}"
-            );
-        }
+        assert!(
+            long > short,
+            "longer text should be wider: {short} vs {long}"
+        );
     }
 
     #[test]
     fn wrap_produces_multiple_lines_for_a_narrow_width() {
-        let e = TextEngine::new();
+        let e = TextEngine::new_without_system_fonts();
         let s = TextStyle {
-            family: "sans-serif",
+            family: "Noto Sans",
             size: 16.0,
             bold: false,
             italic: false,
         };
         let text = "the quick brown fox jumps over the lazy dog again and again";
         let lines = e.wrap(text, 120.0, s);
-        if cfg!(windows) {
-            assert!(lines.len() > 1, "narrow width should wrap, got {lines:?}");
-            // No line should exceed the max width (single long words excepted).
-            for line in &lines {
-                if line.contains(' ') {
-                    assert!(
-                        e.measure(line, s) <= 120.0 + s.size, // small slack
-                        "line too wide: {line:?}"
-                    );
-                }
+        assert!(lines.len() > 1, "narrow width should wrap, got {lines:?}");
+        // No line should exceed the max width (single long words excepted).
+        for line in &lines {
+            if line.contains(' ') {
+                assert!(
+                    e.measure(line, s) <= 120.0 + s.size, // small slack
+                    "line too wide: {line:?}"
+                );
             }
         }
     }
 
     #[test]
     fn unconstrained_width_is_one_line() {
-        let e = TextEngine::new();
+        let e = TextEngine::new_without_system_fonts();
         let s = TextStyle {
-            family: "sans-serif",
+            family: "Noto Sans",
             size: 16.0,
             bold: false,
             italic: false,
@@ -287,22 +312,21 @@ mod tests {
     fn shared_engine_matches_owned_engine() {
         // The free `wrap` (shared per-thread engine) must agree with a fresh
         // `TextEngine` on the same input — otherwise layout's line count would
-        // diverge from render's line count.
+        // diverge from render's line count. Both load the bundled Noto Sans
+        // baseline, so this is hermetic.
         let s = TextStyle {
-            family: "sans-serif",
+            family: "Noto Sans",
             size: 16.0,
             bold: false,
             italic: false,
         };
         let text = "wrap this at a narrow width to force multiple lines here";
-        let owned = TextEngine::new().wrap(text, 100.0, s);
+        let owned = TextEngine::new_without_system_fonts().wrap(text, 100.0, s);
         let shared = super::wrap(text, 100.0, s);
-        if cfg!(windows) {
-            assert_eq!(
-                owned, shared,
-                "shared engine must produce identical line breaks"
-            );
-        }
+        assert_eq!(
+            owned, shared,
+            "shared engine must produce identical line breaks"
+        );
     }
 
     #[test]

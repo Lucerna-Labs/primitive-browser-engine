@@ -10,6 +10,7 @@
 
 #![allow(non_snake_case)]
 #![allow(clippy::upper_case_acronyms)] // FFI type aliases mirror the Win32 names
+#![allow(dead_code)] // demo binary: platform-specific helpers (Win32/GDI) are live on Windows, dead elsewhere
 
 use pmre_kit::{
     ux::{Align, Dim, Edges, Justify, Style, UxNode},

@@ -1,0 +1,12 @@
+[package]
+name = "pbe-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Protocol dispatch — routes a URL to its per-protocol crate (http, ws, data). The single composition point every browser caller goes through; each protocol lives in its own swappable crate behind it."
+
+[dependencies]
+pbe-proto-http = { workspace = true }
+pbe-proto-ws = { workspace = true }
+pbe-proto-data = { workspace = true }

@@ -5,6 +5,61 @@ and `cap-text-shape` contracts used by the browser are vendored under `crates/`
 with their original package metadata. A fresh clone does not depend on Jesse's
 machine-local crate store.
 
+> **Status (2026-07-15):** the network on-ramp is now a **modular protocol
+> layer** — one crate per modern fetch protocol, each independently
+> swappable, debuggable, and upgradable. A new `pbe-proto` dispatch crate
+> routes a URL to the matching protocol crate:
+>
+> - **`pbe-proto-http`** — `http`/`https`, driving the sealed system HTTP
+>   client (zero linked HTTP/TLS deps; the same security posture as before).
+> - **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455): handshake via
+>   the sealed HTTP client + a pure-Rust frame codec. No linked TLS/HTTP.
+> - **`pbe-proto-data`** — `data:` URIs (RFC 2397): pure byte work, zero
+>   I/O, zero deps.
+>
+> `pbe-net` is now a thin facade over `pbe-proto`, preserving the original
+> `fetch` / `fetch_bytes` / `FetchedPage` / `FetchedBytes` API so existing
+> callers (`pbe-shell`, `pbe-orchestrator`) keep working unchanged while
+> transparently gaining `ws`/`wss`/`data:` routing. Legacy schemes
+> (`file://`, `ftp://`, `scp://`, …) are rejected as `UnsupportedScheme`
+> rather than silently mis-handled — modern protocols only, no backward
+> compatibility with old protocols, by design.
+>
+> Verified: 66 new tests across the protocol crates (6 + 8 + 25 + 13 + 9 in
+> `pbe-proto`/`-http`/`-ws`/`-data`/`pbe-net`), plus 7 `pbe-shell`
+> scheme-classification + WebSocket-integration tests;
+> `cargo clippy --all-targets -- -D warnings`
+> clean and `cargo fmt --check` clean across every touched crate. See the
+> updated Crates section below and `ROADMAP.md`.
+
+> **Status (2026-07-16):** the engine gained the four capabilities that
+> made it a usable modern browser — each in its own swappable crate or
+> behind the existing kit boundary, per the doctrine:
+>
+> - **JavaScript** (new `pbe-js` crate): wraps boa (pure-Rust ECMAScript,
+>   no C build chain). `<script>` runs during page load; `console.log`,
+>   `document.getTitle/setTitle`, and `fetch()` (routed through the
+>   modular protocol layer) are wired into the browser. Script errors are
+>   non-fatal. Why boa not V8: V8 links C++ and drags a foreign engine
+>   into our address space; boa is pure-Rust, auditable — the same
+>   trade `ring`-over-`aws-lc-rs` makes for TLS.
+> - **Image codecs** (new `pbe-img-codecs` crate): JPEG + WebP + GIF via
+>   the `image` crate behind a swappable boundary; the in-kit BMP/PNG
+>   decoders stay zero-dep. The browser dispatches by magic bytes.
+> - **Form controls**: `<input>`/`<button>`/`<textarea>`/`<select>` now
+>   render as interactive widgets (the kit's `Style::input/.button`),
+>   with stable per-page widget ids (base 1000+, never colliding with
+>   the chrome's 1–99). Previously dropped by the reducer.
+> - **CSS child combinator + attribute selectors**: `div > p` matches a
+>   direct child (not a deeper descendant); `[attr]`, `[attr=val]`,
+>   `[attr^=val]`, `[attr$=val]`, `[attr*=val]` parse and match against
+>   id/class. Sibling combinators (`+`/`~`), `*`, and pseudo-classes
+>   (`:hover`) still fail closed (need sibling-stack / interaction
+>   state the reducer doesn't thread yet).
+>
+> Verified: 215 workspace tests pass (was 184); `cargo clippy --workspace
+> --all-targets -- -D warnings` clean; `cargo fmt --all --check` clean.
+
 The renderer still presents one `pmre-kit` API, but its implementation is split
 across focused core, raster, text, layout, HTML, and showcase crates. No Rust
 crate in the published workspace exceeds the 4,000-source-line ceiling.
@@ -213,9 +268,34 @@ applied to networking as to rendering. Consequences:
 
 ### Crates
 
-- **`pbe-net`** — network on-ramp; drives the sealed system `curl` binary via
-  `std::process` (zero linked HTTP/TLS deps). Called directly, not through a
-  bus.
+- **`pbe-net`** — network on-ramp **facade**; delegates to the modular
+  `pbe-proto` protocol layer while preserving the original `fetch` /
+  `fetch_bytes` API for existing callers. Called directly, not through a bus.
+- **`pbe-proto`** — the **protocol dispatch** layer: the single composition
+  point that routes a URL to its per-protocol crate. Owns the shared
+  `Resource` type and `FetchError` enum; each modern protocol lives in its
+  own swappable crate behind it:
+  - **`pbe-proto-http`** — `http`/`https`; drives the sealed system HTTP
+    client binary via `std::process` (zero linked HTTP/TLS deps).
+  - **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455); persistent
+    connections via `WsConnection::connect` (TCP + rustls TLS for `wss`,
+    client handshake over the socket, then a send/recv frame loop) plus a
+    pure-Rust frame codec. `wss` links `rustls` (pure-Rust `ring` crypto) —
+    a deliberate exception to the "link no crypto" posture, because
+    WebSocket is persistent and the sealed-binary approach cannot carry the
+    bidirectional frame stream. `ws`/`ws(s)` URLs are wired into
+    `pbe-shell` via `Browser::open_websocket`/`poll_websocket`/`send_websocket`/`close_websocket`.
+  - **`pbe-proto-data`** — `data:` URIs (RFC 2397); pure byte work, zero
+    I/O, zero deps.
+  Legacy schemes (`file://`, `ftp://`, `scp://`, …) are rejected as
+  `UnsupportedScheme` — only modern fetch protocols are routed. Each crate
+  can be upgraded, debugged, or swapped in isolation.
+- **`pbe-js`** — JavaScript engine: wraps boa (pure-Rust ECMAScript) with a
+  minimal DOM surface (`console`, `document.title`, `fetch`) routed through
+  caller-supplied hooks. The browser runs `<script>` blocks through this.
+- **`pbe-img-codecs`** — JPEG/WebP/GIF decoders (via the `image` crate)
+  that decode to the kit's `Image` type, behind a swappable boundary. The
+  in-kit BMP/PNG decoders stay zero-dep; the browser dispatches by magic bytes.
 - **`pbe-text`** — single composition point for real, shaper-based text
   measurement + wrapping over `cap-text-shape` (cosmic-text). Kept for
   possible reuse; not currently wired into the render path (`pmre-kit` has

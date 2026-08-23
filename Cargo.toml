@@ -5,6 +5,12 @@ members = [
     "crates/cap-geometry",
     "crates/cap-text-shape",
     "crates/pbe-net",
+    "crates/pbe-proto",
+    "crates/pbe-proto-http",
+    "crates/pbe-proto-ws",
+    "crates/pbe-proto-data",
+    "crates/pbe-img-codecs",
+    "crates/pbe-js",
     "crates/pbe-text",
     "crates/pbe-orchestrator",
     "crates/pbe-shell",
@@ -77,5 +83,22 @@ thiserror = "2.0"
 
 # --- Internal ---
 pbe-net = { path = "crates/pbe-net" }
+
+# --- The modular protocol layer (one crate per modern protocol) ---
+# pbe-proto is the single dispatch point; each protocol (http, ws, data) lives
+# in its own swappable crate behind it. See crates/pbe-proto/src/lib.rs.
+pbe-proto = { path = "crates/pbe-proto" }
+pbe-proto-http = { path = "crates/pbe-proto-http" }
+pbe-proto-ws = { path = "crates/pbe-proto-ws" }
+pbe-proto-data = { path = "crates/pbe-proto-data" }
+
+pmre-core = { path = "crates/pmre-core" }
+pmre-raster = { path = "crates/pmre-raster" }
 pmre-kit = { path = "crates/pmre-kit" }
 pmre-orchestrator = { path = "crates/pmre-orchestrator" }
+# Image codec crates (JPEG/WebP/GIF) — one swappable crate, decodes to the
+# kit's Image type. The in-kit BMP/PNG decoders stay zero-dep; these add the
+# formats most real web images use, behind a modular boundary.
+pbe-img-codecs = { path = "crates/pbe-img-codecs" }
+# JavaScript engine (boa, pure-Rust) + minimal DOM/console/fetch bindings.
+pbe-js = { path = "crates/pbe-js" }

@@ -1,5 +1,168 @@
 # Roadmap
 
+## Done (2026-07-16) — JS engine + image codecs + form controls + CSS combinators
+
+Four capability additions shipped as one batch, each closing a gap
+flagged in the "what else it needs" review. Each lands in its own
+swappable crate or behind the existing kit boundary, per the doctrine.
+
+### JavaScript (`pbe-js`, new crate)
+
+- Wraps boa (pure-Rust ECMAScript, no C build chain). `<script>` runs
+  during page load in `pbe-shell`; `console.log`/`console.error` → stderr,
+  `document.getTitle/setTitle` → page label, `fetch(url)` → the modular
+  `pbe-proto` protocol layer. Script errors are non-fatal (logged + the
+  page still loads), matching real-browser behaviour.
+- Why boa not V8: V8 links C++ and drags a foreign engine into our
+  address space; boa is pure-Rust, auditable — the same trade `ring`-
+  over-`aws-lc-rs` makes for TLS. boa 0.20's safe native-function API
+  requires `Copy` closures, so hooks are stashed in `thread_local!` slots
+  the closures read from (fine: the browser is single-threaded, like
+  `cap-text-shape`'s shaper). No `unsafe`.
+- 7 tests: arithmetic, function def+call, syntax/throw errors, console
+  routing, document.title round-trip, fetch via hook.
+
+### Image codecs (`pbe-img-codecs`, new crate)
+
+- JPEG + WebP + GIF decoders via the `image` crate, behind a swappable
+  boundary that decodes to the kit's `Image` type. The in-kit BMP/PNG
+  decoders stay zero-dep; `pbe-shell`'s `decode_image_bytes` dispatches
+  by magic bytes (BMP/PNG first, then this crate).
+- 8 tests including JPEG + WebP round-trips against synthesized images.
+
+### Form controls (kit: `pmre-html`)
+
+- `<input>`/`<button>`/`<textarea>`/`<select>` removed from `is_dropped`
+  and rendered as interactive widgets (`Style::input/.button`, hit-tested
+  by the orchestrator's `UiState`). A per-parse `IdAlloc` (base 1000+)
+  gives each control a stable numeric widget id that never collides with
+  the browser chrome's 1–99. `parse_open` + `Dom::Elem`/`Tok::Open` gained
+  a `form_type` field (the `type=` attribute) plumbed through.
+- 3 tests: input renders (not dropped), button renders with label text,
+  multiple inputs get distinct ids >= 1000.
+
+### CSS child combinator + attribute selectors (kit: `pmre-html::css`)
+
+- Child combinator (`A > B`): `ChainStep` carries a `Combinator`
+  (Descendant | Child); `match_chain` walks right-to-left using the
+  *following* step's combinator, so `div > p` matches a direct child but
+  not a deeper descendant.
+- Attribute selectors (`[attr]`, `[attr=val]`, `[attr^=val]`, `[attr$=val]`,
+  `[attr*=val]`): `AttrSelector` + `AttrOp` on `Selector`. Matched against
+  id/class (the only attrs the reducer exposes today); unknown attrs fail
+  closed. Spaces inside quoted values (`[class="a b"]`) aren't tokenized
+  yet (noted).
+- Sibling combinators (`+`/`~`), universal (`*`), pseudo-classes (`:`)
+  still fail closed — they need sibling-stack / interaction-state context
+  the reducer doesn't thread yet.
+- 7 new tests + 2 existing tests updated (they had asserted `>`/`[` were
+  dropped).
+
+### Verification
+
+- Full workspace green: **215 tests pass** (was 184), 0 failed.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo fmt --all --check` clean.
+- New crates: `pbe-js`, `pbe-img-codecs`. New deps: `boa_engine`,
+  `image` (jpeg/webp/gif features), `rustls`+`ring`+`webpki-roots`
+  (already added with the WebSocket persistent connection).
+
+## Done (2026-07-15, latest) — modular protocol layer (one crate per modern protocol)
+
+The network on-ramp was a single monolithic crate (`pbe-net`) that
+handled only `http`/`https` and rejected every other scheme. It now
+delegates to a **modular protocol layer**: one crate per modern fetch
+protocol, each independently swappable, debuggable, and upgradable —
+the composition doctrine applied to protocols as much as to rendering.
+No backward compatibility with old/legacy protocols, by design.
+
+### New crates
+
+- **`pbe-proto`** — the protocol **dispatch** layer: the single
+  composition point that routes a URL to its per-protocol crate. Owns the
+  shared `Resource` type (one return shape for every protocol) and the
+  `FetchError` enum (one error set for every protocol). Classifies a
+  URL's scheme and hands off; no mechanism of its own.
+- **`pbe-proto-http`** — `http`/`https`. Absorbs the existing
+  sealed-binary-driving logic (the `--write-out` metadata sentinel, the
+  byte-level `rfind`, the scheme allow-list, redirect/timeout args) that
+  lived in `pbe-net`. Zero linked HTTP/TLS deps — same security posture
+  as before, just in its own crate.
+- **`pbe-proto-ws`** — `ws`/`wss` (WebSocket, RFC 6455). Splits the
+  protocol into its two concerns: the **handshake** and the **frame codec**.
+  A persistent connection (`WsConnection::connect`) opens a real TCP socket
+  (TLS via `rustls` with the pure-Rust `ring` provider for `wss`), performs
+  the client opening handshake over the socket, verifies the
+  `Sec-WebSocket-Accept` against the key (RFC 6455 §4.2.2, using the test
+  vector as a regression), and then carries a send/recv frame loop
+  (`send_text`/`send_binary`/`recv`/`close`) over the live transport. The
+  frame codec (`encode_frame`/`decode_frame`, opcode + masked payload,
+  7/16/64-bit length, ping→pong, close acknowledgement) is pure Rust and is
+  also exposed standalone.
+
+  `wss://` links a TLS stack (`rustls` + `webpki-roots` + `ring`) — a
+  deliberate, documented exception to the "link no crypto" posture HTTP
+  still keeps, because WebSocket is *persistent*: the sealed-binary approach
+  returns the handshake response and closes the data channel, so it cannot
+  carry the bidirectional frame stream a live connection needs. HTTP, which
+  is request/response over a fresh connection each time, has no such need
+  and stays sealed-binary-driven. `ring` (pure-Rust crypto) is chosen over
+  `aws-lc-rs` to avoid pulling a C build chain into the engine.
+- **`pbe-proto-data`** — `data:` URIs (RFC 2397). Pure byte work, zero
+  I/O, zero deps: split the media type from the data, base64-decode if
+  `;base64` is set, else percent-decode. Defaults to
+  `text/plain;charset=US-ASCII` per the RFC.
+
+### Rewired
+
+- **`pbe-net`** is now a thin **facade** over `pbe-proto`. It preserves
+  the original `fetch` / `fetch_bytes` / `FetchedPage` / `FetchedBytes`
+  API (with `From<Resource>` conversions) so `pbe-shell` and
+  `pbe-orchestrator` keep working unchanged, while transparently routing
+  `ws`/`wss`/`data:` through the new layer. New callers should prefer
+  the `pbe_proto` API directly (one `Resource` for every protocol).
+- **`pbe-shell`** `classify()` and the image/stylesheet fetch helpers now
+  recognize all modern schemes (`http(s)`/`ws(s)`/`data:`) as network
+  URLs, so the browser can navigate to (and resolve `<a href>`/`<img
+  src>`/`<link href>` against) any of them. `file:` access stays a
+  browser-layer concern (`std::fs`), never a network protocol.
+
+### Modern only, no legacy
+
+Only the protocols a modern browser fetches over are routed: `http`,
+`https`, `ws`, `wss`, `data`. Legacy schemes (`file://`, `ftp://`,
+`scp://`, …) are rejected by `pbe-proto` as `UnsupportedScheme` (with
+the scheme name in the error) rather than silently mis-handled. This is
+deliberate: the request was modern protocols only, no backward
+compatibility with old protocols.
+
+### Tests + verification
+
+- `pbe-proto`: 6 tests (scheme routing, unsupported-scheme rejection).
+- `pbe-proto-http`: 8 tests (scheme rejection, sentinel split,
+  non-UTF-8 byte preservation).
+- `pbe-proto-ws`: 25 tests (URL parsing, handshake-request construction,
+  RFC 6455 accept-key test vector, key/base64 generation, frame
+  encode/decode round-trips, extended-length, masked-server rejection,
+  handshake-response parsing, **persistent-connection recv loop over a
+  loopback stream** (text frame read, ping→pong auto-answer, close handling,
+  incremental reads across single-byte chunks, masked-send verification)).
+- `pbe-proto-data`: 13 tests (text + base64 + binary, media-type
+  defaults/parameters, error cases).
+- `pbe-net`: 9 tests (legacy facade rejection preserved, `data:` routes
+  through, `Resource` conversions).
+- `pbe-shell`: 4 scheme-classification + href-passthrough tests, plus 3
+  WebSocket-integration tests (poll/close/send on a browser with no open
+  connection). `Browser::open_websocket`/`poll_websocket`/`send_websocket`/
+  `close_websocket` wire the persistent connection into the browser so a
+  page can actually open a live `ws`/`wss` connection and receive
+  server-pushed messages.
+- Full green sweep on the touched crates: `cargo test` (66 new tests,
+  all passing), `cargo clippy --all-targets -- -D warnings` clean,
+  `cargo fmt --check` clean.
+- The pre-existing `cap-text-shape` test failures (cosmic-text needs
+  system fonts unavailable in the sandbox) are unchanged and unrelated.
+
 ## Done (2026-07-04, latest) — `<blockquote>` semantic default + `<hr>` respects CSS
 
 Two small kit fixes shipped together. Both improved how real content pages

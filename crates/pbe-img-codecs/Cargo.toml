@@ -1,0 +1,15 @@
+[package]
+name = "pbe-img-codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Image codecs (JPEG, WebP, GIF) that decode to the kit's Image type. One swappable modular crate; the in-kit BMP/PNG decoders stay zero-dep."
+
+[dependencies]
+pmre-core = { workspace = true }
+pmre-raster = { workspace = true }
+# Well-tested decoders for the image formats most real web images use. Kept
+# behind this crate's boundary so the kit's zero-dep BMP/PNG decoders stay
+# untouched and each codec family can be upgraded/swapped in isolation.
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "gif"] }
